@@ -20,11 +20,12 @@ from torch.utils.data import DataLoader, Dataset
 
 warnings.filterwarnings("ignore")
 
-from methods.segment_substitution import SegmentSubstitutionCounterfactual
+# from methods.segment_substitution import SegmentSubstitutionCounterfactual
 from utils.metrics import CounterfactualMetrics, MetricsConfig
 from utils.plot_counterfactual import plot_counterfactual
 
 
+# from utils.metrics import
 # ----------------------------
 # CONFIG
 # ----------------------------
@@ -35,7 +36,7 @@ class AnomalyConfig:
     max_epochs: int = 50
     patience: int = 10
     seed: int = 42
-    num_workers: int = 4
+    num_workers: int = 14
     input_size: int = 6
     # model
     hidden_size: int = 128
@@ -387,37 +388,63 @@ if __name__ == "__main__":
 
     ckpt_path = "checkpoints/last.ckpt"
     model = ReconstructionAnomalyModule.load_from_checkpoint(ckpt_path)
+    # Load model
+    model = ReconstructionAnomalyModule.load_from_checkpoint(ckpt_path)
     model.eval()
     threshold = model.optimal_thresh.item()
 
     # Prepare normal core
     normal_windows = torch.tensor(windows[labels == 0][:200], dtype=torch.float32)
 
-    # Select an anomalous window
-    anomaly_idx = np.where(labels == 1)[0][0]
+    # Find an ACTUAL anomaly (high reconstruction error)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    all_scores = []
+    with torch.no_grad():
+        for i in range(len(windows)):
+            x_test = (
+                torch.tensor(windows[i], dtype=torch.float32).unsqueeze(0).to(device)
+            )
+            x_hat = model(x_test)
+            score = ((x_test - x_hat) ** 2).mean().item()
+            all_scores.append(score)
+
+    all_scores = np.array(all_scores)
+
+    # Find windows that are ACTUALLY anomalous (score > threshold)
+    actual_anomalies = np.where(all_scores > threshold)[0]
+
+    if len(actual_anomalies) == 0:
+        print("⚠️ No actual anomalies found! Using highest scoring window...")
+        anomaly_idx = int(np.argmax(all_scores))
+    else:
+        # Pick a strong anomaly (highest score)
+        anomaly_idx = actual_anomalies[np.argmax(all_scores[actual_anomalies])]
+
     x = torch.tensor(windows[anomaly_idx], dtype=torch.float32)
 
     print(f"📊 Anomaly index: {anomaly_idx}")
+    print(f"   Ground truth label: {labels[anomaly_idx]}")
+    print(f"   Reconstruction score: {all_scores[anomaly_idx]:.4f}")
     print(f"   Threshold: {threshold:.4f}")
+    print(f"   Is actual anomaly: {all_scores[anomaly_idx] > threshold}")
 
     # =====================================================
     # 3. GENERATE COUNTERFACTUAL
     # =====================================================
-    from methods.annealing import SegmentSimulatedAnnealingCF
+    from methods.motif import MotifGuidedSegmentRepairCF
 
-    cf_method = SegmentSimulatedAnnealingCF(
+    cf_method = MotifGuidedSegmentRepairCF(
         model=model,
         threshold=threshold,
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         normal_core=normal_windows,
-        max_evals=2000,
-        min_seg_len=4,
-        max_seg_len=32,
-        steps=600,
-        t0=1.0,
-        lam_score=1.0,
-        lam_dist=0.25,
-        lam_smooth=0.15,
+        max_segments_per_len=12,
+        top_motifs_per_segment=8,
+        lengths=(4, 6, 8, 10, 12, 16, 20, 24),
+        edge_blend=2,
+        use_error_guidance=True,
     )
 
     result = cf_method.generate(x)
@@ -450,48 +477,63 @@ if __name__ == "__main__":
     # =====================================================
     # 5. PRINT RESULTS
     # =====================================================
+    # =====================================================
+    # 5. PRINT RESULTS
+    # =====================================================
     if result is None:
         print("❌ No counterfactual found")
     else:
         print("✅ COUNTERFACTUAL FOUND\n")
 
         print(f"CF Generation:")
-        print(f"  Score:         {result['score']:.4f}")
-        print(f"  Threshold:     {threshold:.4f}")
-        print(f"  Evaluations:   {result['meta']['evals']}")
-        if "last_segment" in result["meta"]:  # ✅ Fixed: SA uses 'last_segment'
-            print(f"  Last segment:  {result['meta']['last_segment']}")
-        if "distance_l2" in result["meta"]:
-            print(f"  L2 distance:   {result['meta']['distance_l2']:.4f}")
-        if "last_alpha" in result["meta"]:
-            print(f"  Last alpha:    {result['meta']['last_alpha']:.4f}")
+        print(f"  Score:            {result['score']:.4f}")
+        print(f"  Threshold:        {threshold:.4f}")
+
+        # Check if already valid
+        if result["meta"].get("already_valid", False):
+            print("\n⚠️  Input was already valid - no modification needed\n")
+        else:
+            # These only exist when CF was actually generated
+            print(f"  Base score:       {result['meta']['base_score']:.4f}")
+            print(f"  Method:           {result['meta']['method']}")
+
+            # Motif-specific info
+            print(f"\nMotif Substitution Details:")
+            print(f"  Segment start:    {result['meta']['segment_start']}")
+            print(f"  Segment length:   {result['meta']['segment_len']}")
+            print(f"  Motif source K:   {result['meta']['motif_source_k']}")
+            print(f"  Motif source pos: {result['meta']['motif_source_start']}")
+            print(f"  Edge blend:       {result['meta']['edge_blend']}")
+            print(f"  L1 change:        {result['meta']['l1_change']:.4f}")
+            print(f"  L2 change:        {result['meta']['l2_change']:.4f}")
+            print(f"  Error guidance:   {result['meta']['used_error_guidance']}")
 
         print(f"\nValidity:")
-        print(f"  Valid:         {metrics['valid']}")
-        print(f"  Delta to thr:  {metrics['delta_score_to_thr']:.4f}")
+        print(f"  Valid:            {metrics['valid']}")
+        print(f"  Delta to thr:     {metrics['delta_score_to_thr']:.4f}")
 
         print(f"\nProximity (Distance to Original):")
-        print(f"  RMSE:          {metrics['dist_rmse']:.4f}")
-        print(f"  MAE:           {metrics['dist_mae']:.4f}")
-        print(f"  Max Abs:       {metrics['dist_max_abs']:.4f}")
+        print(f"  RMSE:             {metrics['dist_rmse']:.4f}")
+        print(f"  MAE:              {metrics['dist_mae']:.4f}")
+        print(f"  Max Abs:          {metrics['dist_max_abs']:.4f}")
 
         print(f"\nSparsity (Change Structure):")
-        print(f"  Fraction changed:  {metrics['frac_changed']:.2%}")
-        print(f"  # Segments:        {metrics['n_segments']}")
-        print(f"  Max segment len:   {metrics['max_segment_len']}")
-        print(f"  Contiguous:        {metrics['contiguous']}")
+        print(f"  Fraction changed: {metrics['frac_changed']:.2%}")
+        print(f"  # Segments:       {metrics['n_segments']}")
+        print(f"  Max segment len:  {metrics['max_segment_len']}")
+        print(f"  Contiguous:       {metrics['contiguous']}")
 
         print(f"\nSmoothness:")
-        print(f"  L2 1st diff:   {metrics['smooth_l2_d1']:.4f}")
-        print(f"  L2 2nd diff:   {metrics['smooth_l2_d2']:.4f}")
+        print(f"  L2 1st diff:      {metrics['smooth_l2_d1']:.4f}")
+        print(f"  L2 2nd diff:      {metrics['smooth_l2_d2']:.4f}")
 
         print(f"\nPlausibility (vs Normal Core):")
-        print(f"  NN distance:       {metrics['nn_dist_to_normal_core']:.4f}")
+        print(f"  NN distance:      {metrics['nn_dist_to_normal_core']:.4f}")
         print(
             f"  Bounds violations: {metrics['bounds_violations']} ({metrics['bounds_violation_frac']:.2%})"
         )
-        print(f"  Z-score (mean):    {metrics['z_abs_mean']:.4f}")
-        print(f"  Z-score (max):     {metrics['z_abs_max']:.4f}")
+        print(f"  Z-score (mean):   {metrics['z_abs_mean']:.4f}")
+        print(f"  Z-score (max):    {metrics['z_abs_max']:.4f}")
 
         # =====================================================
         # 6. PLOT COUNTERFACTUAL
@@ -502,18 +544,28 @@ if __name__ == "__main__":
 
         output_dir = "experiment_run"
         os.makedirs(output_dir, exist_ok=True)
-        save_path = os.path.join(output_dir, "simulated_annealing_plot.png")
+        save_path = os.path.join(output_dir, "motif_guided_plot.png")
+
+        # Handle segment for visualization
+        if "segment_start" in result["meta"]:
+            segment_start = result["meta"]["segment_start"]
+            segment_len = result["meta"]["segment_len"]
+            edit_segment = (segment_start, segment_start + segment_len)
+        else:
+            edit_segment = None  # Already valid case
 
         plot_counterfactual(
             x=x.cpu().numpy(),
             x_cf=result["x_cf"].cpu().numpy(),
-            edit_segment=result["meta"].get(
-                "last_segment"
-            ),  # ✅ Fixed: use 'last_segment'
+            edit_segment=edit_segment,
             feature_names=[f"sensor_{i}" for i in range(x.shape[1])],
-            title=f"Simulated Annealing Counterfactual\n"
-            f"Score={result['score']:.4f}, RMSE={metrics['dist_rmse']:.4f}, "
-            f"Evals={result['meta']['evals']}",
+            title=f"Motif-Guided Segment Repair Counterfactual\n"
+            f"Score={result['score']:.4f}, RMSE={metrics['dist_rmse']:.4f}"
+            + (
+                f", SegLen={result['meta']['segment_len']}, Motif K{result['meta']['motif_source_k']}[{result['meta']['motif_source_start']}]"
+                if "segment_len" in result["meta"]
+                else ""
+            ),
             save_path=save_path,
         )
 
@@ -524,7 +576,6 @@ if __name__ == "__main__":
         # =====================================================
         import json
 
-        # ✅ Fixed: Proper serialization helper
         def make_serializable(obj):
             """Convert numpy/torch types to Python native types"""
             if isinstance(obj, (np.integer, np.int64, np.int32)):
@@ -547,20 +598,30 @@ if __name__ == "__main__":
             "model_threshold": float(threshold),
             "counterfactual_result": {
                 "score": float(result["score"]),
-                "evals": int(result["meta"]["evals"]),
-                "method": "Simulated Annealing",
-                "last_segment": result["meta"].get("last_segment"),  # ✅ SA-specific
-                "last_alpha": float(
-                    result["meta"].get("last_alpha", 0.0)
-                ),  # ✅ SA-specific
-                "distance_l2": float(result["meta"].get("distance_l2", 0.0)),
-                "used_normal_core": result["meta"].get("used_normal_core", True),
+                "already_valid": result["meta"].get("already_valid", False),
             },
             "evaluation_metrics": make_serializable(metrics),
         }
 
-        # ✅ Fixed: Save to experiment_run folder, not cfg.log_dir
-        json_path = os.path.join(output_dir, "simulated_annealing_summary.json")
+        # Add motif-specific fields only if they exist
+    if "base_score" in result["meta"]:
+        combined_results["counterfactual_result"].update(
+            {
+                "base_score": float(result["meta"]["base_score"]),
+                "method": result["meta"]["method"],
+                "segment_start": int(result["meta"]["segment_start"]),
+                "segment_len": int(result["meta"]["segment_len"]),
+                "motif_source_k": int(result["meta"]["motif_source_k"]),
+                "motif_source_start": int(result["meta"]["motif_source_start"]),
+                "edge_blend": int(result["meta"]["edge_blend"]),
+                "l1_change": float(result["meta"]["l1_change"]),
+                "l2_change": float(result["meta"]["l2_change"]),
+                "clip_quantiles": result["meta"]["clip_quantiles"],
+                "used_error_guidance": bool(result["meta"]["used_error_guidance"]),
+            }
+        )
+
+        json_path = os.path.join(output_dir, "motif_guided_summary.json")
         with open(json_path, "w") as f:
             json.dump(combined_results, f, indent=4)
 

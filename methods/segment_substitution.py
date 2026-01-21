@@ -1,6 +1,8 @@
+from typing import Any, Dict, Optional
+
 import torch
 from torch import Tensor
-from typing import Optional, Dict, Any
+
 
 class SegmentSubstitutionCounterfactual:
     """
@@ -71,6 +73,3 @@ class SegmentSubstitutionCounterfactual:
                             "segment": (start, end),
                         },
                     }
-                    
-                    
-                  

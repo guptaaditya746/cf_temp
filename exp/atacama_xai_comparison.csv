@@ -1,3 +1,4 @@
 Method,Success %,Valid %,Avg Score,Avg RMSE,Avg Sparsity,Avg Evals,Avg NN Dist
 Segment Substitution,100.0,100.0,1.5250,3.7982,13.3%,-,1.2758
 Nearest Prototype,100.0,100.0,0.3937,3.3500,100.0%,-,0.0000
+Motif,100.0,100.0,0.3471,3.5961,19.8%,-,0.8374
