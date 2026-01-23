@@ -258,145 +258,145 @@ def generate_latent_counterfactual(
         raise ValueError("cfg.mode must be 'scalar_cmaes' or 'moo_nsga2'")
 
 
-# -------------------------
-# Wrapper Class for Common API
-# -------------------------
+# # -------------------------
+# # Wrapper Class for Common API
+# # -------------------------
 
 
-class LatentSpaceCounterfactual:
-    """
-    Latent-space counterfactual generator wrapped to match the common CF API.
+# class LatentSpaceCounterfactual:
+#     """
+#     Latent-space counterfactual generator wrapped to match the common CF API.
 
-    Usage:
-        cf_method = LatentSpaceCounterfactual(
-            model=model,
-            threshold=threshold,
-            normal_windows=normal_windows,
-            device=device,
-            encoder=encoder_fn,
-            decoder=decoder_fn,
-            constraint_spec=constraint_spec,
-            cfg=cfg,  # optional
-        )
-        result = cf_method.generate(x_anomaly)
-    """
+#     Usage:
+#         cf_method = LatentSpaceCounterfactual(
+#             model=model,
+#             threshold=threshold,
+#             normal_windows=normal_windows,
+#             device=device,
+#             encoder=encoder_fn,
+#             decoder=decoder_fn,
+#             constraint_spec=constraint_spec,
+#             cfg=cfg,  # optional
+#         )
+#         result = cf_method.generate(x_anomaly)
+#     """
 
-    def __init__(
-        self,
-        model,
-        threshold,
-        normal_windows,
-        device,
-        encoder,
-        decoder,
-        constraint_spec,
-        cfg=None,
-    ):
-        """
-        Args:
-            model: Anomaly detection model (for score_fn)
-            threshold: Validity threshold (tau)
-            normal_windows: Normal examples for reference (B, L, F)
-            device: torch device
-            encoder: Function x → z
-            decoder: Function z → x_hat
-            constraint_spec: DecodedConstraintSpec instance
-            cfg: RunnerConfig (optional, defaults to scalar CMA-ES)
-        """
-        self.model = model
-        self.threshold = float(threshold)
-        self.device = device
-        self.encoder = encoder
-        self.decoder = decoder
-        self.constraint_spec = constraint_spec
+#     def __init__(
+#         self,
+#         model,
+#         threshold,
+#         normal_windows,
+#         device,
+#         encoder,
+#         decoder,
+#         constraint_spec,
+#         cfg=None,
+#     ):
+#         """
+#         Args:
+#             model: Anomaly detection model (for score_fn)
+#             threshold: Validity threshold (tau)
+#             normal_windows: Normal examples for reference (B, L, F)
+#             device: torch device
+#             encoder: Function x → z
+#             decoder: Function z → x_hat
+#             constraint_spec: DecodedConstraintSpec instance
+#             cfg: RunnerConfig (optional, defaults to scalar CMA-ES)
+#         """
+#         self.model = model
+#         self.threshold = float(threshold)
+#         self.device = device
+#         self.encoder = encoder
+#         self.decoder = decoder
+#         self.constraint_spec = constraint_spec
 
-        # Default config if not provided
-        if cfg is None:
-            cfg = RunnerConfig(
-                mode="scalar_cmaes",
-                eps_validity=0.05,
-                latent_eps=1.5,
-                seed=42,
-                cmaes_cfg=CMAESConfig(
-                    sigma0=0.3, max_evals=500, stop_on_first_valid=False
-                ),
-                selection_cfg=SelectionConfig(
-                    require_validity=True,
-                    robustness_trials=6,
-                    robustness_sigma=0.03,
-                    robustness_valid_frac=0.67,
-                ),
-            )
-        self.cfg = cfg
+#         # Default config if not provided
+#         if cfg is None:
+#             cfg = RunnerConfig(
+#                 mode="scalar_cmaes",
+#                 eps_validity=0.05,
+#                 latent_eps=1.5,
+#                 seed=42,
+#                 cmaes_cfg=CMAESConfig(
+#                     sigma0=0.3, max_evals=500, stop_on_first_valid=False
+#                 ),
+#                 selection_cfg=SelectionConfig(
+#                     require_validity=True,
+#                     robustness_trials=6,
+#                     robustness_sigma=0.03,
+#                     robustness_valid_frac=0.67,
+#                 ),
+#             )
+#         self.cfg = cfg
 
-        # Encode normal windows to latent space
-        self.normalcore_z = self._encode_normal_core(normal_windows)
+#         # Encode normal windows to latent space
+#         self.normalcore_z = self._encode_normal_core(normal_windows)
 
-    def _encode_normal_core(self, normal_windows):
-        """Encode normal windows to latent space (B, D)"""
-        with torch.no_grad():
-            # Ensure shape is (B, L, F)
-            if normal_windows.ndim == 2:
-                normal_windows = normal_windows.unsqueeze(0)
+#     def _encode_normal_core(self, normal_windows):
+#         """Encode normal windows to latent space (B, D)"""
+#         with torch.no_grad():
+#             # Ensure shape is (B, L, F)
+#             if normal_windows.ndim == 2:
+#                 normal_windows = normal_windows.unsqueeze(0)
 
-            z_list = []
-            for i in range(normal_windows.shape[0]):
-                z = self.encoder(normal_windows[i].to(self.device))
-                z_list.append(z.cpu())
+#             z_list = []
+#             for i in range(normal_windows.shape[0]):
+#                 z = self.encoder(normal_windows[i].to(self.device))
+#                 z_list.append(z.cpu())
 
-            return torch.stack(z_list, dim=0)
+#             return torch.stack(z_list, dim=0)
 
-    def _score_fn(self, x):
-        """Compute anomaly score for window x"""
-        with torch.no_grad():
-            x_device = x.to(self.device).unsqueeze(0)  # (1, L, F)
-            score = self.model.decision_function(x_device.cpu().numpy())
-            return float(score[0])
+#     def _score_fn(self, x):
+#         """Compute anomaly score for window x"""
+#         with torch.no_grad():
+#             x_device = x.to(self.device).unsqueeze(0)  # (1, L, F)
+#             score = self.model.decision_function(x_device.cpu().numpy())
+#             return float(score[0])
 
-    def generate(self, x_anomaly):
-        """
-        Generate counterfactual for x_anomaly.
+#     def generate(self, x_anomaly):
+#         """
+#         Generate counterfactual for x_anomaly.
 
-        Args:
-            x_anomaly: Tensor of shape (L, F)
+#         Args:
+#             x_anomaly: Tensor of shape (L, F)
 
-        Returns:
-            Result dict with keys: x_cf, z_cf, score, meta
-            Returns None if generation fails
-        """
-        # Ensure input is on correct device
-        x = x_anomaly.to(self.device)
+#         Returns:
+#             Result dict with keys: x_cf, z_cf, score, meta
+#             Returns None if generation fails
+#         """
+#         # Ensure input is on correct device
+#         x = x_anomaly.to(self.device)
 
-        # Compute original score
-        score_orig = self._score_fn(x)
+#         # Compute original score
+#         score_orig = self._score_fn(x)
 
-        # Generate counterfactual
-        result = generate_latent_counterfactual(
-            x=x,
-            encoder=self.encoder,
-            decoder=self.decoder,
-            score_fn=self._score_fn,
-            tau=self.threshold,
-            constraint_spec=self.constraint_spec,
-            normalcore_z=self.normalcore_z,
-            cfg=self.cfg,
-        )
+#         # Generate counterfactual
+#         result = generate_latent_counterfactual(
+#             x=x,
+#             encoder=self.encoder,
+#             decoder=self.decoder,
+#             score_fn=self._score_fn,
+#             tau=self.threshold,
+#             constraint_spec=self.constraint_spec,
+#             normalcore_z=self.normalcore_z,
+#             cfg=self.cfg,
+#         )
 
-        # Add original score to meta
-        result["meta"]["score_orig"] = score_orig
+#         # Add original score to meta
+#         result["meta"]["score_orig"] = score_orig
 
-        # Add evaluation count if available
-        if "n_evals" in result["meta"]:
-            result["meta"]["evals"] = result["meta"]["n_evals"]
+#         # Add evaluation count if available
+#         if "n_evals" in result["meta"]:
+#             result["meta"]["evals"] = result["meta"]["n_evals"]
 
-        # Return None if failed (to match other methods' API)
-        if result["meta"]["status"] != "success":
-            print(
-                f"⚠️  CF generation failed: {result['meta'].get('failure_type', 'unknown')}"
-            )
-            return None
+#         # Return None if failed (to match other methods' API)
+#         if result["meta"]["status"] != "success":
+#             print(
+#                 f"⚠️  CF generation failed: {result['meta'].get('failure_type', 'unknown')}"
+#             )
+#             return None
 
-        return result
+#         return result
 
 
 # -------------------------
