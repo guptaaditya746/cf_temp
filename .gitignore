@@ -13,7 +13,7 @@ experiment_run/
 # IPython
 profile_default/
 ipython_config.py
-
+git/
 # Remove previous ipynb_checkpoints
 #   git rm -r .ipynb_checkpoints/
 

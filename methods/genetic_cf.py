@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from optimizer_nsga2 import NSGA2Config, NSGA2Optimizer
-from sensor_constraints import SensorConstraintManager
+
+from methods.genetic.optimizer_nsga2 import NSGA2Config, NSGA2Optimizer
+from methods.genetic.sensor_constraints import SensorConstraintManager
 
 # ============================================================
 # Genome definition (problem-specific, NOT optimizer-specific)
