@@ -25,12 +25,12 @@ except ImportError:
     raise ImportError("Please install the external library: pip install pytorch-tcn")
 
 from methods.latent.decoded_constraints import DecodedConstraintSpec
+from methods.latent.latent_cf import RunnerConfig
 from methods.latent.optimizers import CMAESConfig
 from methods.latent.selection_and_validation import SelectionConfig
-from methods.latent_cf import RunnerConfig
 
 # Latent method imports
-from methods.runner import LatentSpaceCounterfactual
+from methods.latent_final import LatentSpaceCounterfactual
 
 # Utility imports
 from utils.metrics import CounterfactualMetrics, MetricsConfig
@@ -266,6 +266,7 @@ def train_model(cfg, windows):
 # =====================================================
 def load_atacama_data(data_path: str, window_size: int = 64, stride: int = 1):
     from pathlib import Path
+
     import pandas as pd
 
     print(f"📂 Loading Atacama data from: {data_path}")
@@ -418,6 +419,11 @@ if __name__ == "__main__":
     res = runner.generate(x_anom)
 
     if res:
+        plot_counterfactual(
+            x_anom.cpu().numpy(),
+            res["x_cf"].cpu().numpy(),
+            title="TCN Counterfactual",
+            save_path="experiment_run/tcn_cf.png",
         plot_counterfactual(
             x_anom.cpu().numpy(),
             res["x_cf"].cpu().numpy(),
