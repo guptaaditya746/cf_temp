@@ -19,12 +19,12 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
 from methods.latent.decoded_constraints import DecodedConstraintSpec
+from methods.latent.latent_cf import RunnerConfig
 from methods.latent.optimizers import CMAESConfig
 from methods.latent.selection_and_validation import SelectionConfig
-from methods.latent_cf import RunnerConfig
 
 # Latent method imports
-from methods.runner import LatentSpaceCounterfactual
+from methods.latent_final import LatentSpaceCounterfactual
 
 # Utility imports
 from utils.metrics import CounterfactualMetrics, MetricsConfig
