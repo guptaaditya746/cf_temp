@@ -66,10 +66,48 @@ class CandidateSelector:
         self.cfg = cfg
         self.score_fn = score_fn
 
+    def _check_feasibility(self, cres: Any) -> bool:
+        """
+        Safely extract boolean feasibility from constraint result.
+        Handles: bool, numpy arrays, PyTorch tensors, and objects with .feasible attribute.
+        """
+        if not hasattr(cres, "feasible"):
+            return True
+
+        feasible_value = cres.feasible
+
+        if isinstance(feasible_value, bool):
+            return feasible_value
+
+        if isinstance(feasible_value, (int, np.integer)):
+            return bool(feasible_value)
+
+        if isinstance(feasible_value, np.ndarray):
+            if feasible_value.size == 1:
+                return bool(feasible_value.item())
+            else:
+                return bool(feasible_value.all())
+
+        if hasattr(feasible_value, "item"):  # PyTorch Tensor
+            try:
+                if hasattr(feasible_value, "numel") and feasible_value.numel() == 1:
+                    return bool(feasible_value.item())
+                elif hasattr(feasible_value, "all"):
+                    return bool(feasible_value.all())
+                else:
+                    return bool(feasible_value)
+            except (ValueError, RuntimeError):
+                return False
+
+        try:
+            return bool(feasible_value)
+        except (ValueError, RuntimeError, TypeError):
+            return False
+
     def select(
         self,
-        candidates: List[Any],  # InfillCandidate-like
-        constraint_results: List[Any],  # ConstraintResult
+        candidates: List[Any],
+        constraint_results: List[Any],
     ) -> Optional[SelectionResult]:
         if not candidates:
             return None
@@ -79,7 +117,8 @@ class CandidateSelector:
         # 1) Evaluate anomaly score + filter by feasibility
         records = []
         for cand, cres in zip(candidates, constraint_results):
-            if not cres.feasible:
+            # ✅ FIXED: Safe feasibility check
+            if not self._check_feasibility(cres):
                 continue
 
             x_cf_np = (

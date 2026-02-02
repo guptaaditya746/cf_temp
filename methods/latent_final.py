@@ -8,9 +8,9 @@ from typing import Optional
 import torch
 
 from methods.latent.decoded_constraints import DecodedConstraintSpec
+from methods.latent.latent_cf import RunnerConfig, generate_latent_counterfactual
 from methods.latent.optimizers import CMAESConfig
 from methods.latent.selection_and_validation import SelectionConfig
-from methods.latent_cf import RunnerConfig, generate_latent_counterfactual
 
 
 class LatentSpaceCounterfactual:
@@ -52,9 +52,9 @@ class LatentSpaceCounterfactual:
 
         # Default config if not provided
         if cfg is None:
+            from methods.latent.latent_cf import RunnerConfig
             from methods.latent.optimizers import CMAESConfig
             from methods.latent.selection_and_validation import SelectionConfig
-            from methods.latent_cf import RunnerConfig
 
             cfg = RunnerConfig(
                 mode="scalar_cmaes",
@@ -131,7 +131,7 @@ class LatentSpaceCounterfactual:
             Result dict with keys: x_cf, z_cf, score, meta
             Returns None if generation fails
         """
-        from methods.latent_cf import generate_latent_counterfactual
+        from methods.latent.latent_cf import generate_latent_counterfactual
 
         # Ensure input is on correct device
         x = x_anomaly.to(self.device)
