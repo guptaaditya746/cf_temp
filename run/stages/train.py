@@ -13,6 +13,36 @@ from ..utils.io import load_npz, save_yaml
 from ..utils.model_io import export_torchscript
 
 
+class LSTMAutoencoder(nn.Module):
+    """LSTM Autoencoder for time-series."""
+
+    def __init__(self, F: int, hidden_size: int, num_layers: int, dropout: float = 0.0):
+        super().__init__()
+        self.encoder = nn.LSTM(
+            input_size=F,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.decoder = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.proj = nn.Linear(hidden_size, F)
+
+    def forward(self, x):
+        B, L, F = x.shape
+        _, (h_n, c_n) = self.encoder(x)
+        z = h_n[-1]
+        dec_in = z.unsqueeze(1).repeat(1, L, 1)
+        dec_out, _ = self.decoder(dec_in, (h_n, c_n))
+        return self.proj(dec_out)
+
+
 class Conv1dAE(nn.Module):
     """
     Simple reconstruction model for (N,L,F) windows.
@@ -84,14 +114,26 @@ def run_train(run_dir: Path, cfg: Dict[str, Any]) -> TrainOut:
     N, L, F = train.shape
 
     mcfg = cfg["model"]
+    model_type = str(mcfg["type"])
     dev = _device(str(mcfg.get("device", "cpu")))
-    model = Conv1dAE(
-        F=F,
-        channels=list(mcfg["channels"]),
-        latent=int(mcfg["latent"]),
-        kernel=int(mcfg["kernel"]),
-        dropout=float(mcfg.get("dropout", 0.0)),
-    ).to(dev)
+
+    if model_type == "conv1dae":
+        model = Conv1dAE(
+            F=F,
+            channels=list(mcfg["channels"]),
+            latent=int(mcfg["latent"]),
+            kernel=int(mcfg["kernel"]),
+            dropout=float(mcfg.get("dropout", 0.0)),
+        ).to(dev)  # existing
+    elif model_type == "lstm":
+        model = LSTMAutoencoder(
+            F=F,
+            hidden_size=int(mcfg["hidden_size"]),
+            num_layers=int(mcfg["num_layers"]),
+            dropout=float(mcfg.get("dropout", 0.0)),
+        ).to(dev)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
 
     lr = float(mcfg["lr"])
     bs = int(mcfg["batch_size"])

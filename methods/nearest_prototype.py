@@ -1,7 +1,7 @@
+from typing import Any, Dict, Optional
 
 import torch
 from torch import Tensor
-from typing import Optional, Dict, Any
 
 
 class NearestPrototypeCounterfactual:
@@ -48,6 +48,7 @@ class NearestPrototypeCounterfactual:
 
         # Distance to prototypes (for minimality)
         distances = ((self.prototypes - x.unsqueeze(0)) ** 2).mean(dim=(1, 2))
+        # Get indices that would sort the distances tensor in ascending order
         sorted_idx = torch.argsort(distances)
 
         for idx in sorted_idx:
@@ -66,4 +67,3 @@ class NearestPrototypeCounterfactual:
                 }
 
         return None
-      

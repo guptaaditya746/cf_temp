@@ -26,6 +26,32 @@ class PreprocessOut:
     config_path: Path
 
 
+def load_atacama(cfg_data: Dict[str, Any]) -> np.ndarray:
+    """Load Atacama pickle with proper preprocessing."""
+    import pandas as pd
+    from sklearn.preprocessing import StandardScaler
+
+    filepath = cfg_data.get("raw_path")
+    df = pd.read_pickle(filepath)
+
+    # Binarize labels
+    label_mapping = {0: 0, 1: 1, 2: 1}
+    df["binary_label"] = df["label"].map(label_mapping).fillna(0).astype(int)
+
+    # Extract features
+    feature_cols = cfg_data.get("feature_cols", [])
+    available_features = [c for c in df.columns if any(f in c for f in feature_cols)]
+
+    X_raw = df[available_features].values
+
+    # Standardize
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_raw)
+
+    # Return (T, F) - windowing happens later in runpreprocess()
+    return X_scaled.astype(np.float32)
+
+
 def _load_raw_dataset(dataset: str, cfg_data: Dict[str, Any]) -> np.ndarray:
     """
     Replace this with your dataset adapters.
@@ -34,6 +60,9 @@ def _load_raw_dataset(dataset: str, cfg_data: Dict[str, Any]) -> np.ndarray:
     raw_path = cfg_data.get("raw_path")
     if raw_path is None:
         raise ValueError("data.raw_path must be set (or implement a dataset resolver).")
+
+    if dataset == "atacama":
+        return load_atacama(cfg_data)
 
     raw = load_npz(raw_path)
     # Expect key "x" as (T,F) OR (N,L,F) already. If already windowed, we'll treat it as windows.

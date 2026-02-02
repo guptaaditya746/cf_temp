@@ -118,8 +118,8 @@ DATAFILE = (
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "experiments", "benchmark_all_methods")
 
 # --- Data Processing ---
-WINDOW_SIZE = 512
-STEP_SIZE = 1
+WINDOW_SIZE = 64
+STEP_SIZE = 10
 FEATURE_COLUMNS = [
     "temperature_2m (°C)",
     "relative_humidity_2m (%)",
@@ -129,8 +129,8 @@ FEATURE_COLUMNS = [
     "wind_speed_10m (km/h)",
 ]
 # --- Benchmark Parameters ---
-N_NORMAL_CORE = 20  # Size of reference normal dataset
-N_TEST_ANOMALIES = 3  # Number of test anomalies per method
+N_NORMAL_CORE = 200  # Size of reference normal dataset
+N_TEST_ANOMALIES = 1  # Number of test anomalies per method
 RANDOM_SEED = 42
 
 
@@ -150,7 +150,7 @@ class AnomalyConfig:
     dropout: float = 0.2
 
     # Training
-    max_epochs: int = 1  # Quick training for benchmark
+    max_epochs: int = 2  # Quick training for benchmark
     patience: int = 10
     lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -514,6 +514,27 @@ class ReconstructionAnomalyModule(pl.LightningModule):
         score_val = ((x - x_hat) ** 2).mean()
         return float(score_val.item())
 
+    # In your ReconstructionAnomalyModule class
+    def get_performance_summary(self):
+        """Returns a dictionary of key training metrics."""
+        return {
+            "best_val_f1": float(self.best_val_f1.item())
+            if hasattr(self, "best_val_f1")
+            else None,
+            "optimal_threshold": float(self.optimal_thresh.item()),
+            "input_size": self.cfg.input_size,
+            "hidden_size": self.cfg.hidden_size,
+        }
+
+    def export_torchscript(self, file_path: str):
+        """Exports the underlying model to TorchScript format."""
+        self.eval()
+        # Create example input for tracing
+        example_input = torch.randn(1, 512, self.cfg.input_size).to(self.device)
+        scripted_model = torch.jit.trace(self.model, example_input)
+        scripted_model.save(file_path)
+        print(f"✓ Model and weights saved in TorchScript: {file_path}")
+
 
 class GenerativeAdapter:
     def __init__(self, pipeline, model, threshold, device):
@@ -547,7 +568,7 @@ class GenerativeAdapter:
         if cf_res is None:
             return None
         return {
-            "xcf": torch.tensor(cf_res.xcf, dtype=torch.float32),
+            "xcf": torch.tensor(cf_res.x_cf, dtype=torch.float32),
             "score": cf_res.score,
             "meta": cf_res.meta,
         }
@@ -1420,6 +1441,7 @@ def run_benchmark(
     y_labels: np.ndarray,
     threshold: float,
     normal_windows: torch.Tensor,
+    model: ReconstructionAnomalyModule,
     device: torch.device,
     cfg: Optional[BenchmarkConfig] = None,
 ) -> Tuple[Dict, Dict, Dict, np.ndarray]:  # ✅ Added timing dict
@@ -1448,7 +1470,17 @@ def run_benchmark(
         test_subset = np.random.choice(
             anomaly_indices, cfg.n_test_anomalies, replace=False
         )
+    # UPDATED TOP-K SELECTION:
+    # Get scores for all anomalies to find the "top" ones
+    anomaly_scores = []
+    for idx in anomaly_indices:
+        anomaly_scores.append(model.score(torch.tensor(X[idx]).to(device)))
 
+    # Sort anomaly indices by their reconstruction scores in descending order
+    sorted_indices = [
+        x for _, x in sorted(zip(anomaly_scores, anomaly_indices), reverse=True)
+    ]
+    test_subset = np.array(sorted_indices[: cfg.n_test_anomalies])
     # Initialize storage
     all_results = {name: [] for name in all_methods.keys()}
     all_metrics = {name: [] for name in all_methods.keys()}
@@ -1838,13 +1870,24 @@ def main():
 
         print(f"  ✓ Model trained. Threshold: {threshold:.4f}")
 
+        # --- NEW: Save Performance and Model ---
+        perf_metrics = model.get_performance_summary()
+        perf_path = os.path.join(OUTPUT_DIR, "performance_summary.json")
+        with open(perf_path, "w") as f:
+            json.dump(perf_metrics, f, indent=4)
+        print(f"✓ Performance results saved: {perf_path}")
+
+        ts_path = os.path.join(OUTPUT_DIR, "model_ts.pt")
+        model.export_torchscript(ts_path)
         # =====================================================================
         # 3. Build Normal Core
         # =====================================================================
         print("\n[3/7] Building normal core...")
+        # Randomly select indices for the normal core (no replacement)
         normal_indices = np.random.choice(
             len(train_windows), N_NORMAL_CORE, replace=False
         )
+        # Convert selected windows to a PyTorch tensor and move to target device
         normal_core = torch.tensor(
             train_windows[normal_indices], dtype=torch.float32
         ).to(device)
@@ -1853,10 +1896,125 @@ def main():
         # =====================================================================
         # 4. Initialize Methods  ⚠️ THIS IS WHERE all_methods IS CREATED
         # =====================================================================
-        print("\n[4/7] Initializing all methods...")
-        all_methods = initialize_all_methods(  # ✅ THIS LINE MUST BE HERE
-            model, threshold, normal_core, device, train_windows
+        print("\n[4/7] Loading TorchScript model and initializing methods...")
+
+        ts_model_path = os.path.join(OUTPUT_DIR, "model_ts.pt")
+        perf_path = os.path.join(OUTPUT_DIR, "performance_summary.json")
+
+        # Ensure the saved files exist before proceeding
+        if not os.path.exists(ts_model_path) or not os.path.exists(perf_path):
+            raise FileNotFoundError(f"Missing required model files in {OUTPUT_DIR}")
+
+        # Load the saved threshold independently
+        with open(perf_path, "r") as f:
+            saved_perf = json.load(f)
+            # Extract the threshold from the JSON file
+            threshold = float(saved_perf["optimal_threshold"])
+
+        print(f"✓ Loaded independent threshold from JSON: {threshold:.4f}")
+
+        # --- ADAPTER FOR BENCHMARK ---
+        # Since the benchmark expects a ReconstructionAnomalyModule with a .score() method,
+        # we wrap the TorchScript model in a simple proxy class.
+        class TorchScriptProxy:
+            def __init__(
+                self,
+                model,
+                threshold,
+                device,
+                num_layers=2,
+                input_size=6,
+                hidden_size=128,
+            ):
+                self.model = model
+                # Store threshold as a tensor to mimic the original module's buffer
+                self.optimal_thresh = torch.tensor(threshold, device=device)
+                self.device = device
+
+                # Mock cfg object to satisfy methods like Latent-Space (CMA-ES)
+                @dataclass
+                class MockConfig:
+                    num_layers: int
+                    input_size: int
+                    hidden_size: int
+
+                self.cfg = MockConfig(
+                    num_layers=num_layers,
+                    input_size=input_size,
+                    hidden_size=hidden_size,
+                )
+
+            @torch.no_grad()
+            def score(self, x: Any) -> float:
+                # Ensure input is a Tensor
+                if not isinstance(x, torch.Tensor):
+                    x = torch.tensor(x, dtype=torch.float32)
+
+                if x.ndim == 2:
+                    x = x.unsqueeze(0)
+
+                x = x.to(self.device)
+                # The scripted model expects exactly a Tensor
+                x_hat = self.model(x)
+                return float(torch.mean((x - x_hat) ** 2).item())
+
+            def __call__(self, x: Any) -> torch.Tensor:
+                if not isinstance(x, torch.Tensor):
+                    x = torch.tensor(x, dtype=torch.float32)
+                return self.model(x.to(self.device))
+
+            def eval(self):
+                """Mock eval to satisfy initialization checks in CF methods."""
+                self.model.eval()
+                return self
+
+            def train(self, mode=True):
+                """Mock train to satisfy initialization checks."""
+                self.model.train(mode)
+                return self
+
+        # =====================================================================
+        # 4. Initialize Methods (Independent Load)
+        # =====================================================================
+        print("\n[4/7] Loading artifacts and initializing methods...")
+
+        ts_model_path = os.path.join(OUTPUT_DIR, "model_ts.pt")
+        perf_path = os.path.join(OUTPUT_DIR, "performance_summary.json")
+
+        if not os.path.exists(ts_model_path) or not os.path.exists(perf_path):
+            raise FileNotFoundError(f"Required artifacts not found in {OUTPUT_DIR}")
+
+        # Load the saved threshold and architecture from JSON
+        with open(perf_path, "r") as f:
+            saved_perf = json.load(f)
+            threshold = float(saved_perf["optimal_threshold"])
+            i_size = int(saved_perf["input_size"])
+            h_size = int(saved_perf["hidden_size"])
+            # Use default num_layers if not explicitly saved in JSON
+            n_layers = 2
+
+        print(f"  ✓ Loaded threshold: {threshold:.4f}")
+
+        # Load the TorchScript model
+        loaded_model = torch.jit.load(ts_model_path, map_location=DEVICE)
+        loaded_model.eval()
+
+        # Create the independent proxy
+        model_proxy = TorchScriptProxy(
+            model=loaded_model,
+            threshold=threshold,
+            device=DEVICE,
+            num_layers=n_layers,
+            input_size=i_size,
+            hidden_size=h_size,
         )
+
+        all_methods = initialize_all_methods(
+            model_proxy, threshold, normal_core, DEVICE, train_windows
+        )
+        all_methods.pop("Generative Infilling", None)
+        all_methods.pop("Latent-Space (CMA-ES)", None)
+        all_methods.pop("Genetic (NSGA-II)", None)
 
         # =====================================================================
         # 5. Run Benchmark
@@ -1870,7 +2028,14 @@ def main():
 
         # ✅ Capture timings
         all_results, all_metrics, all_timings, test_subset = run_benchmark(
-            all_methods, X, y_labels, threshold, normal_core, device, benchmark_cfg
+            all_methods=all_methods,
+            X=X,
+            y_labels=y_labels,
+            threshold=threshold,
+            normal_windows=normal_core,
+            device=device,
+            model=model_proxy,  # Explicitly assigned
+            cfg=benchmark_cfg,
         )
 
         # =====================================================================
@@ -1897,6 +2062,47 @@ def main():
             OUTPUT_DIR,
         )
 
+        # ============================================================================
+        # [8/7] BATCH VISUALIZATION FOR TOP 20 ANOMALIES
+        # ============================================================================
+        print("\n[8/7] Generating and saving plots for top 20 anomalies...")
+        plot_dir = os.path.join(OUTPUT_DIR, "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+
+        # test_subset contains the indices of the top 20 anomalies
+        for i, anom_idx in enumerate(test_subset):
+            # original anomalous window (L, F)
+            x_orig = X[anom_idx]
+
+            for method_name, results in all_results.items():
+                # Get result for this specific anomaly and method
+                res = results[i]
+
+                if res is not None and res.get("x_cf") is not None:
+                    # Ensure x_cf is a numpy array
+                    x_cf_plot = res["x_cf"]
+                    if hasattr(x_cf_plot, "detach"):  # Handle torch tensors
+                        x_cf_plot = x_cf_plot.detach().cpu().numpy()
+
+                    # Extract meta information for the plot if available
+                    edit_seg = res.get("meta", {}).get("segment")
+
+                    # Construct a descriptive filename
+                    save_filename = f"top_{i + 1:02d}_idx{anom_idx}_{method_name.replace(' ', '_')}.png"
+                    save_path = os.path.join(plot_dir, save_filename)
+
+                    # Call your provided plot function
+                    plot_counterfactual(
+                        x=x_orig,
+                        x_cf=x_cf_plot,
+                        feature_names=FEATURE_COLUMNS,
+                        edit_segment=edit_seg,
+                        show_diff=True,
+                        title=f"Top {i + 1} Anomaly (Idx: {anom_idx}) - {method_name}\nScore: {res['score']:.4f}",
+                        save_path=save_path,
+                    )
+
+        print(f"✓ Visualization complete. Plots saved to: {plot_dir}")
         # ✅ Print total runtime
         total_elapsed = time.time() - total_start
         print("\n" + "=" * 80)
