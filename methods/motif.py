@@ -251,6 +251,18 @@ import torch
 
 
 class MotifGuidedSegmentRepairCF:
+    """
+    Counterfactual generator that repairs anomalous time-series segments
+    by substituting them with similar motifs extracted from a normal core.
+
+    Core idea:
+    - Detect anomalous segments
+    - Replace them with closest normal motifs
+    - Keep changes minimal while crossing the anomaly threshold
+
+
+    """
+
     def __init__(
         self,
         model,
@@ -267,10 +279,11 @@ class MotifGuidedSegmentRepairCF:
     ):
         # Inheritance and super() removed.
         # Manually setting the base attributes here:
+        # Store core components (model-driven anomaly detector)
         self.model = model
         self.threshold = threshold
         self.device = device
-
+        # Validate normal reference data
         if normal_core is None:
             raise ValueError("normal_core is required")
         if normal_core.dim() != 3:
@@ -305,33 +318,39 @@ class MotifGuidedSegmentRepairCF:
         return float(score.squeeze().item())
 
     def _clip(self, x: torch.Tensor) -> torch.Tensor:
+        """Clamp values to normal-core quantile range."""
         return torch.max(torch.min(x, self._clip_hi), self._clip_lo)
 
     def _recon_and_per_t_error(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute reconstruction and per-timestep error."""
-        # x is (L, F) - need to add batch dimension for model
-        if x.dim() == 2:
-            x_3d = x.unsqueeze(0)  # (1, L, F)
-        else:
-            x_3d = x
+        """
+        Reconstruct input and compute per-timestep error.
+        Used to guide where repairs should happen.
+        """
+        x_3d = x.unsqueeze(0) if x.dim() == 2 else x
 
         with torch.no_grad():
             x_hat_3d = self.model(x_3d)
 
-        x_hat = x_hat_3d.squeeze(0)  # Remove batch dim -> (L, F)
-        per_t = ((x - x_hat) ** 2).mean(dim=-1)  # (L,) - error per timestep
-
+        x_hat = x_hat_3d.squeeze(0)
+        per_t = ((x - x_hat) ** 2).mean(dim=-1)
         return x_hat, per_t
 
     def _candidate_starts(
         self, per_t: torch.Tensor, seg_len: int, L: int
     ) -> torch.Tensor:
+        """
+        Select candidate segment start indices based on
+        highest average reconstruction error.
+        """
         if L - seg_len <= 0:
             return torch.empty(0, dtype=torch.long, device=per_t.device)
 
-        win = per_t.unfold(0, seg_len, 1).mean(dim=-1)  # (L-seg_len+1,)
+        # Sliding-window average error
+        win = per_t.unfold(0, seg_len, 1).mean(dim=-1)
+
+        # Limit number of candidate segments
         n = min(self.max_segments_per_len, win.numel())
         if n <= 0:
             return torch.empty(0, dtype=torch.long, device=per_t.device)
@@ -341,34 +360,45 @@ class MotifGuidedSegmentRepairCF:
         return idx.to(torch.long)
 
     def _all_motifs_of_len(self, seg_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract all contiguous motifs of length seg_len
+        from the normal core.
+        """
         K, L, F = self.normal_core.shape
         if seg_len > L:
-            return torch.empty(0, seg_len, F, device=self.device), torch.empty(
-                0, 2, dtype=torch.long, device=self.device
+            return (
+                torch.empty(0, seg_len, F, device=self.device),
+                torch.empty(0, 2, dtype=torch.long, device=self.device),
             )
 
-        motifs = []
-        meta = []
+        motifs, meta = [], []
         for k in range(K):
-            w = self.normal_core[k]  # (L,F)
+            w = self.normal_core[k]
             for s in range(0, L - seg_len + 1):
                 motifs.append(w[s : s + seg_len])
                 meta.append((k, s))
+
         if not motifs:
-            return torch.empty(0, seg_len, F, device=self.device), torch.empty(
-                0, 2, dtype=torch.long, device=self.device
+            return (
+                torch.empty(0, seg_len, F, device=self.device),
+                torch.empty(0, 2, dtype=torch.long, device=self.device),
             )
 
-        motifs_t = torch.stack(motifs, dim=0)  # (M, seg_len, F)
-        meta_t = torch.tensor(meta, dtype=torch.long, device=self.device)  # (M,2)
-        return motifs_t, meta_t
+        return (
+            torch.stack(motifs, dim=0),
+            torch.tensor(meta, dtype=torch.long, device=self.device),
+        )
 
     def _top_motifs(self, x_seg: torch.Tensor, motifs: torch.Tensor) -> torch.Tensor:
-        # x_seg: (seg_len,F), motifs: (M,seg_len,F)
+        """
+        Select closest motifs to the current segment
+        using MSE distance.
+        """
         if motifs.numel() == 0:
             return torch.empty(0, dtype=torch.long, device=self.device)
+
         diff = motifs - x_seg.unsqueeze(0)
-        d = (diff * diff).mean(dim=(1, 2))  # (M,)
+        d = (diff * diff).mean(dim=(1, 2))
         k = min(self.top_motifs_per_segment, d.numel())
         return torch.topk(d, k=k, largest=False).indices
 
@@ -379,6 +409,10 @@ class MotifGuidedSegmentRepairCF:
         motif: torch.Tensor,
         edge_blend: int,
     ) -> torch.Tensor:
+        """
+        Replace a segment in x with a motif,
+        blending edges to reduce discontinuities.
+        """
         # x: (L,F), motif: (seg_len,F)
         L, F = x.shape
         seg_len = motif.shape[0]
@@ -407,6 +441,10 @@ class MotifGuidedSegmentRepairCF:
         return out
 
     def generate(self, x: torch.Tensor) -> Optional[Dict[str, Any]]:
+        """
+        Generate a counterfactual that repairs x
+        so its anomaly score falls below the threshold.
+        """
         if x.dim() != 2:
             raise ValueError("x must have shape (L,F)")
         x = x.to(self.device)

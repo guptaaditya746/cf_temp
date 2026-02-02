@@ -122,38 +122,39 @@ class ConstraintEvaluator:
     # ----------------------------
     # Hard constraints
     # ----------------------------
-    def _check_hard_constraints(
-        self,
-        x_orig: np.ndarray,
-        x_cf: np.ndarray,
-        mask: np.ndarray,
-    ) -> Dict[str, float]:
+    def _check_hard_constraints(self, x_orig, x_cf, mask) -> Dict[str, float]:
         violations: Dict[str, float] = {}
+
+        # Ensure inputs are valid
+        if not np.isfinite(x_cf).all():
+            violations["non_finite_values"] = float("inf")
+            return violations
 
         # value bounds
         if self.cfg.value_min is not None:
             v = float(np.min(x_cf))
             if v < self.cfg.value_min:
-                violations["value_min"] = v
+                violations["value_min"] = self.cfg.value_min - v  # Violation amount
 
         if self.cfg.value_max is not None:
             v = float(np.max(x_cf))
             if v > self.cfg.value_max:
-                violations["value_max"] = v
+                violations["value_max"] = v - self.cfg.value_max  # Violation amount
 
         # immutable features unchanged
         for f in self.immutable:
             if f < 0 or f >= x_cf.shape[1]:
+                violations[f"invalid_immutable_idx_{f}"] = float(f)
                 continue
             delta = np.max(np.abs(x_cf[:, f] - x_orig[:, f]))
-            if delta > 0:
+            if delta > 1e-6:  # Floating point tolerance
                 violations[f"immutable_feature_{f}"] = float(delta)
 
         # max absolute delta
         if self.cfg.max_abs_delta is not None:
             d = np.max(np.abs(x_cf - x_orig))
             if d > self.cfg.max_abs_delta:
-                violations["max_abs_delta"] = float(d)
+                violations["max_abs_delta"] = float(d - self.cfg.max_abs_delta)
 
         return violations
 
@@ -219,45 +220,44 @@ class ConstraintEvaluator:
                 penalty += float(np.mean(np.abs(curv)))
         return penalty / float(F)
 
-    def _spectral_penalty(
-        self,
-        x_orig: np.ndarray,
-        x_cf: np.ndarray,
-        mask: np.ndarray,
-    ) -> float:
+    def _spectral_penalty(self, x_orig, x_cf, mask) -> float:
         L, F = x_cf.shape
+        if F == 0 or L < 4:  # Need minimum length for Welch
+            return 0.0
+
         p = 0.0
         for f in range(F):
             _, pxx_o = welch(x_orig[:, f], nperseg=min(self.cfg.psd_nperseg, L))
             _, pxx_c = welch(x_cf[:, f], nperseg=min(self.cfg.psd_nperseg, L))
-            # normalize
             pxx_o = pxx_o / (np.sum(pxx_o) + 1e-8)
             pxx_c = pxx_c / (np.sum(pxx_c) + 1e-8)
             p += float(np.mean(np.abs(pxx_o - pxx_c)))
         return p / float(F)
 
     def _coupling_penalty(self, x_cf: np.ndarray) -> float:
+        if self.scaler is None or self.pca is None:
+            return 0.0  # Skip if PCA not fitted
+
         X = self.scaler.transform(x_cf)
         Xp = self.pca.transform(X)
         Xr = self.pca.inverse_transform(Xp)
         resid = np.mean((X - Xr) ** 2)
         return float(resid)
 
-    def _dtw_penalty(
-        self,
-        x_orig: np.ndarray,
-        x_cf: np.ndarray,
-        mask: np.ndarray,
-    ) -> float:
-        # restrict to masked timesteps
+    def _dtw_penalty(self, x_orig, x_cf, mask) -> float:
         idx = np.any(mask, axis=1)
-        if not np.any(idx):
+        if not idx.any():  # No masked timesteps
             return 0.0
+
         d = 0.0
         F = x_cf.shape[1]
         for f in range(F):
-            d += dtw(x_orig[idx, f], x_cf[idx, f])
-        return float(d / F)
+            seg_orig = x_orig[idx, f].reshape(-1, 1)  # DTW expects (n, 1)
+            seg_cf = x_cf[idx, f].reshape(-1, 1)
+            if len(seg_orig) < 2:  # DTW needs at least 2 points
+                continue
+            d += dtw(seg_orig, seg_cf)
+        return float(d / F) if F > 0 else 0.0
 
     # ----------------------------
     # PCA fitting
