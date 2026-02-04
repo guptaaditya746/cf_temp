@@ -79,6 +79,13 @@ class CandidateSelector:
         if isinstance(feasible_value, bool):
             return feasible_value
 
+        if torch.is_tensor(val):
+            if val.numel() == 0:
+                return True
+            return bool(
+                val.all().item()
+            )  # .all() reduces, .item() converts to Python bool
+
         if isinstance(feasible_value, (int, np.integer)):
             return bool(feasible_value)
 

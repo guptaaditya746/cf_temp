@@ -159,14 +159,25 @@ class NormalCoreDonorMatcher:
         """
         results: Dict[Tuple[int, int], DonorMatchResult] = {}
         cfg = self.cfg
+        total_segments = len(segment_candidates)
+        for i, seg in enumerate(segment_candidates):
+            # <--- Add Progress Print --->
+            print(
+                f"  [Matcher] Processing segment {i + 1}/{total_segments} (len={seg.length})..."
+            )
 
-        for seg in segment_candidates:
             key = (seg.start, seg.end)
             target = self._extract_target(x, key)
+            all_matches = []
 
-            all_matches: List[DonorSegment] = []
-
+            # This inner loop is the heavy part
             for k in range(self.normal_core.shape[0]):
+                # <--- Add Granular Print (only if really slow) --->
+                if k % 100 == 0:
+                    print(
+                        f"    Scanning donor {k}/{self.normal_core.shape[0]}", end="\r"
+                    )
+
                 donor_ts = self.normal_core[k].numpy()
                 matches = self._scan_donor(
                     donor=donor_ts,

@@ -72,7 +72,9 @@ class _CallbackProblem(Problem):
         out["F"] = F
         if self.n_constr > 0:
             if G is None:
-                raise ValueError("Problem expects constraints (n_constr > 0) but eval_fn returned None for G.")
+                raise ValueError(
+                    "Problem expects constraints (n_constr > 0) but eval_fn returned None for G."
+                )
                 raise ValueError(
                     "Problem expects constraints (n_constr > 0) but eval_fn returned None for G."
                 )
@@ -107,7 +109,7 @@ class NSGA2Optimizer:
         n_constr: int,
         eval_fn: Callable[[np.ndarray], Tuple[np.ndarray, Optional[np.ndarray]]],
         termination: Optional[Termination] = None,
-        return_all: bool = False,
+        return_all: bool = True,
     ) -> NSGA2Result:
         xl_arr = np.asarray(xl, dtype=float).reshape(-1)
         xu_arr = np.asarray(xu, dtype=float).reshape(-1)

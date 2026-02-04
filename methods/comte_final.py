@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Dict, Optional
 
 import torch
@@ -50,20 +51,24 @@ class CoMTEReconstructionCF:
           - Final CF dict, OR
           - Failure report dict
         """
-
+        t_start = time.time()
         # ---------- PART 1 ----------
         seg_out = self.segment_generator.generate(x)
         segment_candidates = seg_out.candidates
+        print(f"[CoMTE] Segmentation took: {time.time() - t_start:.3f}s")
 
         if not segment_candidates:
             return self._fail("no_segments", "No anomalous segments detected.")
 
         # ---------- PART 2 ----------
+        t_match = time.time()
         donor_matches = self.donor_matcher.match(
             x=x,
             segment_candidates=segment_candidates,
         )
-
+        print(
+            f"[CoMTE] Matching {len(segment_candidates)} segments took: {time.time() - t_match:.3f}s"
+        )  #
         if not donor_matches:
             return self._fail(
                 "no_donors",
@@ -72,6 +77,7 @@ class CoMTEReconstructionCF:
             )
 
         # ---------- PART 5 (includes 3 & 4) ----------
+        t_eval = time.time()  # <--- Timer Start
         print(f"Evaluation started for {len(segment_candidates)} candidates...")
         evals = self.selector.evaluate_candidates(
             x=x,
@@ -88,7 +94,7 @@ class CoMTEReconstructionCF:
         if best is None or not best.valid:
             report = self.failure_handler.analyze(evals, tau=self.tau)
             return report.__dict__ if report else None
-
+        print(f"[CoMTE] Selection/Eval took: {time.time() - t_eval:.3f}s")
         return self.selector.build_output(best)
 
     # -------------------------------------------------
