@@ -1,10 +1,11 @@
+# cf_final/methods/genetic_cf.py
 from __future__ import annotations
 
 # Enables postponed evaluation of type annotations.
 # This allows forward references and reduces runtime overhead of typing.
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -199,35 +200,42 @@ class SegmentCounterfactualProblem:
         # single feasibility constraint (score validity)
         G = np.zeros((n, 1), dtype=float)
 
+        # local copies for speed
+        x0 = self._x
+
         for i in range(n):
             # Decode genome
             g = SegmentGenome(*X[i])
-            x_cf = self.decode(g, self._x)
-            x_cf = self.constraints.repair(self._x, x_cf)
+            x_cf = self.decode(g, x0)
+            x_cf = self.constraints.repair(x0, x_cf)
             # -------------------------
             # Hard constraints
             # -------------------------
-            hard = self.constraints.hard_check(self._x, x_cf)
+            hard = self.constraints.hard_check(x0, x_cf)
             if not hard.ok:
                 # Hard violation → infeasible solution
                 G[i, 0] = 1.0
                 F[i, :] = np.inf
-                print("HARD FAIL:", hard.reasons)
+                # print("HARD FAIL:", hard.reasons)
                 # Optional: show how far out of bounds
-                below = (x_cf < self.constraints.val_lo.unsqueeze(0)).sum().item()
-                above = (x_cf > self.constraints.val_hi.unsqueeze(0)).sum().item()
-                print("  below count:", below, "above count:", above)
+                # below = (x_cf < self.constraints.val_lo.unsqueeze(0)).sum().item()
+                # above = (x_cf > self.constraints.val_hi.unsqueeze(0)).sum().item()
+                # print("  below count:", below, "above count:", above)
+                if self._event_cb is not None and self._debug:
+                    self._event_cb(
+                        {
+                            "type": "genetic_hard_fail",
+                            "reasons": list(hard.reasons),
+                        }
+                    )
                 continue
 
             # -------------------------
             # Validity objective
             # -------------------------
             score = float(self.model.score(x_cf))
-            score_excess = max(
-                0.0,
-                score - (self.threshold - self.eps_valid),
-            )
-            print("score:", score, "score_excess:", score_excess)
+            score_excess = score - (self.threshold - self.eps_valid)  # <= 0 is feasible
+            G[i, 0] = float(score_excess)
             # -------------------------
             # Soft constraints
             # -------------------------
@@ -248,18 +256,16 @@ class SegmentCounterfactualProblem:
             # -------------------------
             # Multi-objective vector (all minimized)
             # -------------------------
+            # ---- objective vector (all minimized) ----
+            # Note: score_excess as objective should be nonnegative in many setups,
+            # but we keep raw (can be negative if very valid). If you prefer, use max(0,score_excess).
             F[i, :] = [
                 edit_l1,
-                soft.dyn_violation + soft.curvature_violation,
-                soft.coupling_violation,
+                float(soft.dyn_violation + soft.curvature_violation),
+                float(soft.coupling_violation),
                 normal_dist,
-                score_excess,
+                float(max(0.0, score_excess)),  # objective version
             ]
-
-            # Feasibility constraint:
-            # valid iff score_excess == 0
-            # G[i, 0] = 0.0 if score_excess == 0.0 else score_excess
-            G[i, 0] = 0.0
 
         return F, G
 
@@ -267,62 +273,79 @@ class SegmentCounterfactualProblem:
     # Public API
     # --------------------------------------------------------
 
-    def generate(self, x: torch.Tensor) -> Optional[Dict[str, Any]]:
+    def generate(
+        self,
+        x: torch.Tensor,
+        *,
+        return_all: bool = True,
+        debug: bool = True,
+        event_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
-        Generate a counterfactual explanation for x.
-
-        Returns:
-        - None if no valid counterfactual is found
-        - Dictionary containing x_cf, score, and metadata otherwise
+        Returns dict with:
+          - x_cf
+          - score
+          - meta: includes objectives, genome, and (if return_all) optimizer trace
         """
         x = x.to(self.device)
-        self._x = x  # store original input for evaluation
+        self._x = x
+        self._debug = bool(debug)
+        self._event_cb = event_cb
 
-        # Compute baseline anomaly score
         base_score = float(self.model.score(x))
 
-        # Early exit if already valid
         if base_score <= (self.threshold - self.eps_valid):
             return {
                 "x_cf": x.clone(),
                 "score": base_score,
                 "meta": {
+                    "method": "segment_nsga2_cf",
                     "already_valid": True,
                     "base_score": base_score,
+                    "threshold": self.threshold,
                 },
             }
 
-        # Run NSGA-II optimization
+        # Run NSGA-II
         result = self.optimizer.run(
-            n_var=3,  # genome dimension
-            xl=[0.0, 0.0, 0.0],  # lower bounds
-            xu=[1.0, 1.0, 1.0],  # upper bounds
-            n_obj=5,  # number of objectives
-            n_constr=1,  # number of constraints
+            n_var=3,
+            xl=[0.0, 0.0, 0.0],
+            xu=[1.0, 1.0, 1.0],
+            n_obj=5,
+            n_constr=1,
             eval_fn=self._evaluate_batch,
+            return_all=bool(return_all),
         )
 
-        # No feasible solution found
-        if result.best_idx is None:
+        if result.best_idx is None or result.X is None or len(result.X) == 0:
             return None
 
-        # Decode best solution
-        best_genome = SegmentGenome(*result.X[result.best_idx])
+        best_idx = int(result.best_idx)
+        best_genome = SegmentGenome(*result.X[best_idx])
+
         x_cf = self.decode(best_genome, x)
-        score = float(self.model.score(x_cf))
-        best = result.best_idx
-        x_cf = self.decode(SegmentGenome(*result.X[best]), x)
-        print("final anomaly score:", float(self.model.score(x_cf)))
-        print("final objectives:", result.F[best])
+        x_cf = self.constraints.repair(x, x_cf)
+        score_cf = float(self.model.score(x_cf))
+
+        meta: Dict[str, Any] = {
+            "method": "segment_nsga2_cf",
+            "base_score": base_score,
+            "score_cf": score_cf,
+            "threshold": self.threshold,
+            "best_idx": best_idx,
+            "objectives": result.F[best_idx].tolist()
+            if result.F is not None and len(result.F) > 0
+            else None,
+            "genome": dataclasses.asdict(best_genome),
+            "optimizer_meta": result.meta,
+        }
+
+        # Put trace in a stable place for Stage B
+        if return_all and isinstance(result.meta, dict) and "trace" in result.meta:
+            meta["trace"] = result.meta["trace"]
 
         return {
             "x_cf": x_cf,
-            "score": score,
-            "meta": {
-                "method": "segment_nsga2_cf",
-                "base_score": base_score,
-                "threshold": self.threshold,
-                "objectives": result.F[result.best_idx].tolist(),
-                "genome": dataclasses.asdict(best_genome),
-            },
+            "score": score_cf,
+            "meta": meta,
         }

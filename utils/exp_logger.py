@@ -8,6 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
+import matplotlib.pyplot as plt
+import numpy as np
+
 
 def utcstamp():
     return datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
@@ -116,7 +119,10 @@ class ExperimentLogger:
                 "traceback": traceback.format_exc(),
             },
         )
-        self.write_json(path, {
-            "exception": repr(e),
-            "traceback": traceback.format_exc(),
-        })
+        self.write_json(
+            path,
+            {
+                "exception": repr(e),
+                "traceback": traceback.format_exc(),
+            },
+        )
