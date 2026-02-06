@@ -73,7 +73,9 @@ class ConstraintEvaluator:
         self,
         cfg: ConstraintConfig,
         normalcore: Optional[np.ndarray] = None,  # (K,L,F)
+        debug=False,
     ):
+        self.debug = debug
         self.cfg = cfg
         self.immutable = (
             set(int(i) for i in cfg.immutable_features)
@@ -96,11 +98,56 @@ class ConstraintEvaluator:
         x_cf: np.ndarray,  # (L,F)
         mask: np.ndarray,  # (L,F) bool
     ) -> ConstraintResult:
-        x_orig = self._as_2d(x_orig)
-        x_cf = self._as_2d(x_cf)
-        mask = mask.astype(bool)
+        if self.debug:
+            print(f"\n[ConstraintEvaluator.evaluate]")
+            print(
+                f"  x_orig: type={type(x_orig)}, shape={x_orig.shape}, dtype={x_orig.dtype}"
+            )
+            print(f"  x_cf: type={type(x_cf)}, shape={x_cf.shape}, dtype={x_cf.dtype}")
+            print(f"  mask: type={type(mask)}, shape={mask.shape}, dtype={mask.dtype}")
 
-        hard = self._check_hard_constraints(x_orig, x_cf, mask)
+        try:
+            x_orig = self._as_2d(x_orig)
+            if self.debug:
+                print(
+                    f"  x_orig after _as_2d: shape={x_orig.shape}, dtype={x_orig.dtype}"
+                )
+        except Exception as e:
+            print(f"  ERROR in _as_2d(x_orig): {e}")
+            raise
+
+        try:
+            x_cf = self._as_2d(x_cf)
+            if self.debug:
+                print(f"  x_cf after _as_2d: shape={x_cf.shape}, dtype={x_cf.dtype}")
+        except Exception as e:
+            print(f"  ERROR in _as_2d(x_cf): {e}")
+            raise
+
+        try:
+            mask = mask.astype(bool)
+            if self.debug:
+                print(
+                    f"  mask after bool cast: dtype={mask.dtype}, True count={mask.sum()}"
+                )
+        except Exception as e:
+            print(f"  ERROR converting mask to bool: {e}")
+            raise
+
+        if self.debug:
+            print(f"  Calling _check_hard_constraints...")
+
+        try:
+            hard = self._check_hard_constraints(x_orig, x_cf, mask)
+            if self.debug:
+                print(f"  Hard constraints result: {hard}")
+        except Exception as e:
+            print(f"  ERROR in _check_hard_constraints: {type(e).__name__}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            raise
+
         if hard:
             return ConstraintResult(
                 feasible=False,
@@ -109,7 +156,20 @@ class ConstraintEvaluator:
                 total_soft_penalty=float("inf"),
             )
 
-        soft = self._compute_soft_constraints(x_orig, x_cf, mask)
+        if self.debug:
+            print(f"  Calling _compute_soft_constraints...")
+
+        try:
+            soft = self._compute_soft_constraints(x_orig, x_cf, mask)
+            if self.debug:
+                print(f"  Soft constraints: {soft}")
+        except Exception as e:
+            print(f"  ERROR in _compute_soft_constraints: {type(e).__name__}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            raise
+
         total_penalty = float(sum(soft.values()))
 
         return ConstraintResult(

@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -24,7 +25,19 @@ import torch
 # from part3_constraint_evaluation import ConstraintEvaluator, ConstraintResult
 # from part4_candidate_selection import CandidateSelector
 # from part5_failure_handling import FailureHandler
-from methods.generative.constraint_evaluation import ConstraintResult
+from methods.generative.candidate_selection import CandidateSelector, SelectionConfig
+from methods.generative.constraint_evaluation import (
+    ConstraintConfig,
+    ConstraintEvaluator,
+    ConstraintResult,
+)
+from methods.generative.failure_handling import FailureHandler, FailureReport
+from methods.generative.infilling_engine import (
+    InfillCandidate,
+    InfillingConfig,
+    InfillingEngine,
+)
+from methods.generative.mask_strategy import MaskStrategy, MaskStrategyConfig
 
 
 # -----------------------------------------------------------------------------
@@ -36,7 +49,7 @@ class CounterfactualResult:
     Standardized output for a successful counterfactual generation.
     """
 
-    xcf: np.ndarray  # The final counterfactual window (L, F)
+    x_cf: np.ndarray  # The final counterfactual window (L, F)
     score: float  # The anomaly score of x_cf (should be < threshold)
     meta: Dict[str, Any]  # Provenance data (method used, mask ratio, etc.)
 
@@ -155,42 +168,16 @@ class GenerativeInfillingCounterfactual:
         # D. PART 3: Constraint Evaluation
         # ---------------------------------------------------------------------
         # "Are these replacements physically possible?"
-        # D. PART 3: Constraint Evaluation
-        # D. PART 3: Constraint Evaluation
         constraint_results = []
         for cand in all_candidates:
-            # Ensure proper numpy conversion
-            x_cf_np = cand.x_cf.detach().cpu().numpy().astype(np.float32)
-
-            # CRITICAL: Ensure mask is boolean numpy array
+            # Convert candidate back to numpy for evaluation
+            x_cf_np = cand.x_cf.detach().cpu().numpy()
             mask_np = cand.mask.detach().cpu().numpy()
-            if mask_np.dtype != bool:
-                mask_np = mask_np.astype(bool)
 
-            # Validate shapes before evaluation
-            if x_cf_np.shape != x.shape:
-                print(f"Shape mismatch: x_cf {x_cf_np.shape} vs x {x.shape}")
-                continue
-
-            if mask_np.shape != x.shape:
-                print(f"Mask shape mismatch: {mask_np.shape} vs {x.shape}")
-                continue
-
-            try:
-                cres = self.constraint_evaluator.evaluate(
-                    x_orig=x, x_cf=x_cf_np, mask=mask_np
-                )
-                constraint_results.append(cres)
-            except Exception as e:
-                print(f"Constraint evaluation failed for candidate: {e}")
-                # Create a failure result
-                cres = ConstraintResult(
-                    feasible=False,
-                    hard_violations={"evaluation_error": str(e)},
-                    soft_metrics={},
-                    total_soft_penalty=float("inf"),
-                )
-                constraint_results.append(cres)
+            cres = self.constraint_evaluator.evaluate(
+                x_orig=x, x_cf=x_cf_np, mask=mask_np
+            )
+            constraint_results.append(cres)
 
         # ---------------------------------------------------------------------
         # E. PART 4: Candidate Selection
@@ -207,12 +194,9 @@ class GenerativeInfillingCounterfactual:
         )
 
         # SUCCESS: Return standardized result
-        # In GenerativeInfillingCounterfactual.generate(), before the return:
         if selection is not None:
-            # Debug: Print what selection contains
-
             return CounterfactualResult(
-                xcf=selection.x_cf,
+                x_cf=selection.x_cf,
                 score=selection.score,
                 meta=selection.meta,
             )
@@ -246,12 +230,10 @@ class GenerativeInfillingCounterfactual:
         Delegates to FailureHandler and prints the report.
         In a production API, this might log to a file or raise an Exception.
         """
-        stage = kwargs.pop("stage", "Unknown")
         report = self.failure_handler.analyze(**kwargs)
 
         print("\n" + "!" * 60)
-        print("FAILED TO GENERATE COUNTERFACTUAL")
-        print(f"stage: {stage}")
+        print(f"FAILED TO GENERATE COUNTERFACTUAL")
         print(f"Type:       {report.failure_type}")
         print(f"Reason:     {report.message}")
         print("-" * 30)

@@ -1,3 +1,4 @@
+# cf_final/methods/genetic/optimizer_nsga2.py
 from __future__ import annotations
 
 import dataclasses
@@ -18,12 +19,15 @@ from pymoo.termination import get_termination
 
 @dataclass(frozen=True)
 class NSGA2Config:
-    pop_size: int = 80
-    n_gen: int = 60
+    pop_size: int = 200
+    n_gen: int = 80
     seed: int = 7
     crossover_prob: float = 0.9
     crossover_eta: float = 15.0
     mutation_eta: float = 20.0
+
+    verbose: bool = True
+    save_history: bool = True
     eliminate_duplicates: bool = True
 
 
@@ -63,7 +67,7 @@ class _CallbackProblem(Problem):
             n_constr=n_constr,
             xl=xl.astype(float),
             xu=xu.astype(float),
-            elementwise_evaluation=False,
+            elementwise_evaluation=True,
         )
         self._eval_fn = eval_fn
 
@@ -72,7 +76,9 @@ class _CallbackProblem(Problem):
         out["F"] = F
         if self.n_constr > 0:
             if G is None:
-                raise ValueError("Problem expects constraints (n_constr > 0) but eval_fn returned None for G.")
+                raise ValueError(
+                    "Problem expects constraints (n_constr > 0) but eval_fn returned None for G."
+                )
                 raise ValueError(
                     "Problem expects constraints (n_constr > 0) but eval_fn returned None for G."
                 )
@@ -107,7 +113,7 @@ class NSGA2Optimizer:
         n_constr: int,
         eval_fn: Callable[[np.ndarray], Tuple[np.ndarray, Optional[np.ndarray]]],
         termination: Optional[Termination] = None,
-        return_all: bool = False,
+        return_all: bool = True,
     ) -> NSGA2Result:
         xl_arr = np.asarray(xl, dtype=float).reshape(-1)
         xu_arr = np.asarray(xu, dtype=float).reshape(-1)
@@ -142,7 +148,7 @@ class NSGA2Optimizer:
             termination,
             seed=self.config.seed,
             save_history=bool(return_all),
-            verbose=False,
+            verbose=True,
         )
 
         X = res.X
@@ -194,6 +200,94 @@ class NSGA2Optimizer:
         }
         if return_all and hasattr(res, "history") and res.history is not None:
             meta["history_len"] = len(res.history)
+
+        # -------------------------
+        # TRACE EXTRACTION (for plots)
+        # -------------------------
+        if return_all:
+            trace: Dict[str, Any] = {}
+
+            # Final population (res.pop)
+            try:
+                pop = getattr(res, "pop", None)
+                if pop is not None:
+                    X_final = pop.get("X")
+                    F_final = pop.get("F")
+                    G_final = pop.get("G") if n_constr > 0 else None
+                    CV_final = pop.get("CV") if n_constr > 0 else None
+
+                    trace["X_final"] = (
+                        np.asarray(X_final) if X_final is not None else None
+                    )
+                    trace["F_final"] = (
+                        np.asarray(F_final) if F_final is not None else None
+                    )
+                    trace["G_final"] = (
+                        np.asarray(G_final) if G_final is not None else None
+                    )
+                    trace["CV_final"] = (
+                        np.asarray(CV_final) if CV_final is not None else None
+                    )
+            except Exception as e:
+                trace["final_pop_error"] = repr(e)
+
+            # ND set (res.X/res.F)
+            trace["X_nd"] = np.asarray(res.X) if res.X is not None else None
+            trace["F_nd"] = np.asarray(res.F) if res.F is not None else None
+            trace["G_nd"] = (
+                np.asarray(getattr(res, "G", None))
+                if getattr(res, "G", None) is not None
+                else None
+            )
+            trace["CV_nd"] = (
+                np.asarray(getattr(res, "CV", None))
+                if getattr(res, "CV", None) is not None
+                else None
+            )
+
+            # Per-generation traces from history
+            hist = getattr(res, "history", None)
+            if hist is not None:
+                best_F = []
+                cv_mean = []
+                cv_min = []
+                pop_sizes = []
+
+                for h in hist:
+                    pop = getattr(h, "pop", None)
+                    if pop is None:
+                        best_F.append(np.full((n_obj,), np.nan))
+                        cv_mean.append(np.nan)
+                        cv_min.append(np.nan)
+                        pop_sizes.append(0)
+                        continue
+
+                    Fh = pop.get("F")
+                    CVh = pop.get("CV") if n_constr > 0 else None
+
+                    if Fh is not None and len(Fh) > 0:
+                        Fh = np.asarray(Fh)
+                        best_F.append(np.min(Fh, axis=0))
+                        pop_sizes.append(int(Fh.shape[0]))
+                    else:
+                        best_F.append(np.full((n_obj,), np.nan))
+                        pop_sizes.append(0)
+
+                    if CVh is not None and len(CVh) > 0:
+                        CVh = np.asarray(CVh).reshape(-1)
+                        cv_mean.append(float(np.mean(CVh)))
+                        cv_min.append(float(np.min(CVh)))
+                    else:
+                        cv_mean.append(np.nan)
+                        cv_min.append(np.nan)
+
+                trace["best_F_per_gen"] = np.asarray(best_F, dtype=float)
+                trace["cv_per_gen_mean"] = np.asarray(cv_mean, dtype=float)
+                trace["cv_per_gen_min"] = np.asarray(cv_min, dtype=float)
+                trace["pop_size_per_gen"] = np.asarray(pop_sizes, dtype=int)
+
+            # Attach to meta so Stage B can plot it
+            meta["trace"] = trace
 
         return NSGA2Result(
             X=np.asarray(X) if X is not None else np.empty((0, n_var), dtype=float),
