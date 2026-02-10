@@ -1,12 +1,17 @@
 # cf_metrics.py
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
 
+# -----------------------------
+# Shape helpers
+# -----------------------------
 def _to_2d(x: torch.Tensor) -> torch.Tensor:
     if not isinstance(x, torch.Tensor):
         raise TypeError("Expected torch.Tensor")
@@ -42,6 +47,9 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+# -----------------------------
+# Basic distances
+# -----------------------------
 def _rmse(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(torch.mean((x - y) ** 2) + 1e-12)
 
@@ -54,6 +62,39 @@ def _max_abs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return torch.max(torch.abs(x - y))
 
 
+def _trimmed_mean_abs(delta: torch.Tensor, trim_q: float = 0.99) -> torch.Tensor:
+    """
+    Robust mean(|delta|) ignoring top (1-trim_q) fraction of absolute changes.
+    delta: (L,F)
+    """
+    flat = torch.abs(delta).reshape(-1)
+    if flat.numel() == 0:
+        return torch.tensor(0.0, device=delta.device)
+    thr = torch.quantile(flat, trim_q)
+    kept = flat[flat <= thr]
+    if kept.numel() == 0:
+        return thr  # fallback
+    return kept.mean()
+
+
+def _trimmed_rmse(delta: torch.Tensor, trim_q: float = 0.99) -> torch.Tensor:
+    """
+    Robust RMSE ignoring top (1-trim_q) fraction of squared errors.
+    delta: (L,F) = x_cf - x
+    """
+    flat = (delta**2).reshape(-1)
+    if flat.numel() == 0:
+        return torch.tensor(0.0, device=delta.device)
+    thr = torch.quantile(flat, trim_q)
+    kept = flat[flat <= thr]
+    if kept.numel() == 0:
+        return torch.sqrt(thr + 1e-12)
+    return torch.sqrt(kept.mean() + 1e-12)
+
+
+# -----------------------------
+# Derivatives / smoothness
+# -----------------------------
 def _diff1(x: torch.Tensor) -> torch.Tensor:
     return x[1:] - x[:-1]
 
@@ -63,6 +104,51 @@ def _diff2(x: torch.Tensor) -> torch.Tensor:
     return d1[1:] - d1[:-1]
 
 
+def _tv_l1_first_diff(d: torch.Tensor) -> torch.Tensor:
+    """
+    Total variation (L1) on first differences of edit signal.
+    d: (L,F)
+    """
+    if d.shape[0] < 2:
+        return torch.tensor(0.0, device=d.device)
+    d1 = _diff1(d)
+    return torch.mean(torch.abs(d1))
+
+
+def _boundary_discontinuity(d: torch.Tensor, changed_t: torch.Tensor) -> float:
+    """
+    Measures jump at boundaries of edited region(s): large jumps are less plausible.
+    d: edit signal (L,F)
+    changed_t: (L,) bool
+    """
+    idx = torch.nonzero(changed_t, as_tuple=False).reshape(-1)
+    if idx.numel() == 0:
+        return 0.0
+    idx_sorted = torch.sort(idx).values
+    # boundary points: start and end neighbors of each segment
+    diffs = idx_sorted[1:] - idx_sorted[:-1]
+    breaks = torch.nonzero(diffs > 1, as_tuple=False).reshape(-1)
+    seg_starts = torch.cat([idx_sorted[:1], idx_sorted[breaks + 1]])
+    seg_ends = torch.cat([idx_sorted[breaks], idx_sorted[-1:]])  # inclusive
+
+    vals = []
+    L = d.shape[0]
+    for s, e in zip(seg_starts.tolist(), seg_ends.tolist()):
+        # discontinuity at left boundary: d[s] - d[s-1]
+        if s - 1 >= 0:
+            vals.append(torch.mean(torch.abs(d[s] - d[s - 1])))
+        # discontinuity at right boundary: d[e+1] - d[e]
+        if e + 1 < L:
+            vals.append(torch.mean(torch.abs(d[e + 1] - d[e])))
+
+    if not vals:
+        return 0.0
+    return float(torch.stack(vals).mean().detach().cpu().item())
+
+
+# -----------------------------
+# Segment stats
+# -----------------------------
 def _segment_stats_from_mask(mask: torch.Tensor) -> Dict[str, Any]:
     # mask: (L,) bool
     L = int(mask.numel())
@@ -70,16 +156,16 @@ def _segment_stats_from_mask(mask: torch.Tensor) -> Dict[str, Any]:
     if idx.numel() == 0:
         return {
             "changed_any": False,
-            "n_changed": 0,
-            "frac_changed": 0.0,
-            "n_segments": 0,
-            "max_segment_len": 0,
-            "min_segment_len": 0,
-            "mean_segment_len": 0.0,
-            "segment_lengths": [],
-            "first_change": None,
-            "last_change": None,
-            "contiguous": True,
+            "n_changed_time": 0,
+            "frac_changed_time": 0.0,
+            "n_segments_time": 0,
+            "max_segment_len_time": 0,
+            "min_segment_len_time": 0,
+            "mean_segment_len_time": 0.0,
+            "segment_lengths_time": [],
+            "first_change_t": None,
+            "last_change_t": None,
+            "contiguous_time": True,
         }
 
     idx_sorted = torch.sort(idx).values
@@ -98,19 +184,30 @@ def _segment_stats_from_mask(mask: torch.Tensor) -> Dict[str, Any]:
 
     return {
         "changed_any": True,
-        "n_changed": int(idx_sorted.numel()),
-        "frac_changed": float(idx_sorted.numel() / max(1, L)),
-        "n_segments": n_segs,
-        "max_segment_len": max_len,
-        "min_segment_len": min_len,
-        "mean_segment_len": mean_len,
-        "segment_lengths": seg_lens_list,
-        "first_change": int(idx_sorted[0].item()),
-        "last_change": int(idx_sorted[-1].item()),
-        "contiguous": (n_segs == 1),
+        "n_changed_time": int(idx_sorted.numel()),
+        "frac_changed_time": float(idx_sorted.numel() / max(1, L)),
+        "n_segments_time": n_segs,
+        "max_segment_len_time": max_len,
+        "min_segment_len_time": min_len,
+        "mean_segment_len_time": mean_len,
+        "segment_lengths_time": seg_lens_list,
+        "first_change_t": int(idx_sorted[0].item()),
+        "last_change_t": int(idx_sorted[-1].item()),
+        "contiguous_time": (n_segs == 1),
     }
 
 
+def _span_from_mask(mask: torch.Tensor) -> Optional[Tuple[int, int]]:
+    idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
+    if idx.numel() == 0:
+        return None
+    idx_sorted = torch.sort(idx).values
+    return int(idx_sorted[0].item()), int(idx_sorted[-1].item())
+
+
+# -----------------------------
+# Normal-core plausibility helpers
+# -----------------------------
 def _feature_bounds_from_normal_core(
     normal_core: torch.Tensor,
     q_lo: float = 0.01,
@@ -130,23 +227,29 @@ def _nn_plausibility_dist(
     normal_core: torch.Tensor,
     metric: str = "rmse",
     chunk: int = 256,
+    time_slice: Optional[Tuple[int, int]] = None,
 ) -> float:
     """
-    Returns distance from x_cf to nearest window in NormalCore (K,L,F)
-    using RMSE or MAE. Chunked to reduce memory.
+    Distance from x_cf to nearest window in NormalCore (K,L,F).
+    If time_slice is provided, compares only that span [t0,t1] (inclusive).
     """
     x2 = _to_2d(x_cf)
     nc = _to_3d(normal_core)
-    K = nc.shape[0]
+    if time_slice is not None:
+        t0, t1 = time_slice
+        x2 = x2[t0 : t1 + 1]
+        nc = nc[:, t0 : t1 + 1, :]
 
+    K = nc.shape[0]
     best = None
     for i in range(0, K, chunk):
-        batch = nc[i : i + chunk]  # (B,L,F)
-        # (B,)
+        batch = nc[i : i + chunk]  # (B,l,F)
         if metric == "mae":
             d = torch.mean(torch.abs(batch - x2.unsqueeze(0)), dim=(1, 2))
         else:
-            d = torch.sqrt(torch.mean((batch - x2.unsqueeze(0)) ** 2, dim=(1, 2)) + 1e-12)
+            d = torch.sqrt(
+                torch.mean((batch - x2.unsqueeze(0)) ** 2, dim=(1, 2)) + 1e-12
+            )
         m = d.min()
         best = m if best is None else torch.minimum(best, m)
 
@@ -157,17 +260,23 @@ def _zscore_plausibility(
     x_cf: torch.Tensor,
     normal_core: torch.Tensor,
     eps: float = 1e-6,
+    time_slice: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, float]:
     """
-    Per-feature z-score using NormalCore flattened across time and windows.
-    Returns mean/max absolute z-score over ALL points.
+    Mean/max abs z-score using NormalCore flattened across time and windows.
+    If time_slice is provided, compute on that span only.
     """
     x2 = _to_2d(x_cf)
     nc = _to_3d(normal_core)
     flat = nc.reshape(-1, nc.shape[-1])  # (K*L, F)
     mu = flat.mean(dim=0)
     sd = flat.std(dim=0).clamp_min(eps)
-    z = (x2 - mu) / sd  # (L,F)
+
+    if time_slice is not None:
+        t0, t1 = time_slice
+        x2 = x2[t0 : t1 + 1]
+
+    z = (x2 - mu) / sd
     absz = torch.abs(z)
     return {
         "z_abs_mean": float(absz.mean().detach().cpu().item()),
@@ -175,13 +284,132 @@ def _zscore_plausibility(
     }
 
 
+def _robust_z_mad(
+    x_cf: torch.Tensor,
+    normal_core: torch.Tensor,
+    eps: float = 1e-6,
+    time_slice: Optional[Tuple[int, int]] = None,
+) -> Dict[str, float]:
+    """
+    Robust z using median and MAD (scaled by 1.4826).
+    This is less sensitive to heavy tails / outliers than mean/std.
+    """
+    x2 = _to_2d(x_cf)
+    nc = _to_3d(normal_core)
+    flat = nc.reshape(-1, nc.shape[-1])  # (K*L, F)
+    med = flat.median(dim=0).values
+    mad = (flat - med).abs().median(dim=0).values
+    sd = (1.4826 * mad).clamp_min(eps)
+
+    if time_slice is not None:
+        t0, t1 = time_slice
+        x2 = x2[t0 : t1 + 1]
+
+    z = (x2 - med) / sd
+    absz = z.abs()
+    return {
+        "robust_z_abs_mean": float(absz.mean().detach().cpu().item()),
+        "robust_z_abs_max": float(absz.max().detach().cpu().item()),
+    }
+
+
+def _mahalanobis_plausibility(
+    x_cf: torch.Tensor,
+    normal_core: torch.Tensor,
+    eps: float = 1e-6,
+    time_slice: Optional[Tuple[int, int]] = None,
+) -> Dict[str, float]:
+    """
+    Correlation-aware plausibility: per-time Mahalanobis distance in feature space.
+    Fit mean/cov from NormalCore flattened across windows+time.
+    Then compute mean/max Mahalanobis over time points (or time_slice).
+    """
+    x2 = _to_2d(x_cf)
+    nc = _to_3d(normal_core)
+    flat = nc.reshape(-1, nc.shape[-1]).double()  # (N,F)
+    mu = flat.mean(dim=0)
+
+    # Covariance (F,F) - small (e.g., F=6), safe to invert with regularization.
+    xc = flat - mu
+    cov = (xc.T @ xc) / max(1, flat.shape[0] - 1)
+    cov = cov + eps * torch.eye(cov.shape[0], dtype=cov.dtype, device=cov.device)
+    inv = torch.linalg.pinv(cov)
+
+    if time_slice is not None:
+        t0, t1 = time_slice
+        x2 = x2[t0 : t1 + 1]
+
+    x2d = x2.double()
+    y = x2d - mu
+    # per-time distance: sqrt(y_t^T inv y_t)
+    d2 = torch.einsum("tf,fg,tg->t", y, inv, y).clamp_min(0.0)
+    d = torch.sqrt(d2 + 1e-12)
+    return {
+        "mahal_mean": float(d.mean().detach().cpu().item()),
+        "mahal_max": float(d.max().detach().cpu().item()),
+    }
+
+
+# -----------------------------
+# Scaler handling (scaler.json)
+# -----------------------------
+@dataclass(frozen=True)
+class ScalerSpec:
+    mean: torch.Tensor  # (F,)
+    std: torch.Tensor  # (F,)
+    features: Optional[List[str]] = None
+
+    def to(self, device: torch.device) -> "ScalerSpec":
+        return ScalerSpec(
+            mean=self.mean.to(device), std=self.std.to(device), features=self.features
+        )
+
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std.clamp_min(1e-12)
+
+
+def load_scaler_json(path: str, device: Optional[torch.device] = None) -> ScalerSpec:
+    with open(path, "r") as f:
+        obj = json.load(f)
+
+    mean = obj.get("mean", obj.get("mu", obj.get("center")))
+    std = obj.get("std", obj.get("sigma", obj.get("scale")))
+    feats = obj.get("features", None)
+
+    if mean is None or std is None:
+        raise ValueError(
+            f"Scaler JSON missing mean/std keys. Found keys: {list(obj.keys())}"
+        )
+
+    mean_t = torch.tensor(mean, dtype=torch.float32)
+    std_t = torch.tensor(std, dtype=torch.float32).clamp_min(1e-12)
+    if device is not None:
+        mean_t = mean_t.to(device)
+        std_t = std_t.to(device)
+
+    return ScalerSpec(mean=mean_t, std=std_t, features=feats)
+
+
+# -----------------------------
+# Config
+# -----------------------------
 @dataclass(frozen=True)
 class MetricsConfig:
     eps_change: float = 1e-6
+
+    # Bounds plausibility from normal core
     bounds_q_lo: float = 0.01
     bounds_q_hi: float = 0.99
+
+    # NN plausibility
     nn_metric: str = "rmse"  # "rmse" or "mae"
     nn_chunk: int = 256
+
+    # Robust proximity
+    trim_q: float = 0.99
+
+    # Threshold robustness checks
+    thr_robust_fracs: Tuple[float, ...] = (0.01, 0.03, 0.05)  # +/-1%,3%,5%
 
 
 class CounterfactualMetrics:
@@ -194,12 +422,18 @@ class CounterfactualMetrics:
         cf_result: Optional[Dict[str, Any]],
         threshold: float,
         normal_core: Optional[torch.Tensor] = None,
+        scaler: Optional[Union[ScalerSpec, Dict[str, Any]]] = None,
+        scaler_path: Optional[str] = None,
+        feature_names: Optional[List[str]] = None,
+        topk_features: int = 3,
     ) -> Dict[str, Any]:
         """
         x: (L,F) or (1,L,F)
         cf_result: {"x_cf": Tensor(L,F), "score": float, "meta": dict} or None
         threshold: scalar
         normal_core: (K,L,F) optional, used for plausibility metrics
+        scaler/scaler_path: enables scaled-space metrics (recommended).
+        feature_names: optional for reporting top changed features.
         """
         x0 = _to_2d(x).detach()
         thr = float(threshold)
@@ -209,32 +443,85 @@ class CounterfactualMetrics:
             "threshold": thr,
         }
 
+        # Build scaler spec if provided
+        scaler_spec: Optional[ScalerSpec] = None
+        if scaler_path is not None:
+            scaler_spec = load_scaler_json(scaler_path, device=x0.device)
+        elif isinstance(scaler, ScalerSpec):
+            scaler_spec = scaler.to(x0.device)
+        elif isinstance(scaler, dict):
+            # allow passing {"mean":[...], "std":[...]} etc.
+            tmp_path = None
+            # try to interpret dict directly
+            mean = scaler.get("mean", scaler.get("mu", scaler.get("center", None)))
+            std = scaler.get("std", scaler.get("sigma", scaler.get("scale", None)))
+            if mean is not None and std is not None:
+                scaler_spec = ScalerSpec(
+                    mean=torch.tensor(mean, dtype=torch.float32, device=x0.device),
+                    std=torch.tensor(
+                        std, dtype=torch.float32, device=x0.device
+                    ).clamp_min(1e-12),
+                )
+
         if cf_result is None:
             out.update(
                 {
                     "valid": False,
                     "score_cf": None,
                     "delta_score_to_thr": None,
+                    "margin_to_thr": None,
+                    "valid_robust": None,
                     "dist_rmse": None,
                     "dist_mae": None,
                     "dist_max_abs": None,
-                    "n_changed": None,
-                    "frac_changed": None,
-                    "n_segments": None,
-                    "max_segment_len": None,
-                    "contiguous": None,
+                    "dist_trimmed_rmse": None,
+                    "dist_trimmed_mae": None,
+                    "dist_rmse_scaled": None,
+                    "dist_mae_scaled": None,
+                    "dist_trimmed_rmse_scaled": None,
+                    "dist_trimmed_mae_scaled": None,
+                    "per_feature_rmse": None,
+                    "per_feature_mae": None,
+                    "top_changed_features": None,
+                    "n_changed_time": None,
+                    "frac_changed_time": None,
+                    "n_segments_time": None,
+                    "max_segment_len_time": None,
+                    "contiguous_time": None,
+                    "n_changed_feat": None,
+                    "frac_changed_feat": None,
+                    "n_changed_cell": None,
+                    "frac_changed_cell": None,
                     "smooth_l2_d1": None,
                     "smooth_l2_d2": None,
+                    "tv_l1_d1": None,
+                    "boundary_discontinuity": None,
                     "bounds_violations": None,
                     "bounds_violation_frac": None,
+                    "bounds_violations_edited": None,
+                    "bounds_violation_frac_edited": None,
                     "nn_dist_to_normal_core": None,
+                    "nn_dist_to_normal_core_edited": None,
                     "z_abs_mean": None,
                     "z_abs_max": None,
+                    "z_abs_mean_edited": None,
+                    "z_abs_max_edited": None,
+                    "robust_z_abs_mean": None,
+                    "robust_z_abs_max": None,
+                    "robust_z_abs_mean_edited": None,
+                    "robust_z_abs_max_edited": None,
+                    "mahal_mean": None,
+                    "mahal_max": None,
+                    "mahal_mean_edited": None,
+                    "mahal_max_edited": None,
                     "meta": None,
+                    "evals": None,
+                    "method": None,
                 }
             )
             return out
 
+        # Extract cf
         x_cf = _to_2d(cf_result.get("x_cf")).detach()
         score_cf = _safe_float(cf_result.get("score"))
         meta = cf_result.get("meta", {})
@@ -245,74 +532,216 @@ class CounterfactualMetrics:
 
         out["meta"] = meta
         out["score_cf"] = score_cf
+
+        # Validity / margin
         if score_cf is not None:
             out["valid"] = bool(score_cf <= thr)
             out["delta_score_to_thr"] = float(score_cf - thr)
+            out["margin_to_thr"] = float((thr - score_cf) / (abs(thr) + 1e-12))
         else:
             out["valid"] = False
             out["delta_score_to_thr"] = None
+            out["margin_to_thr"] = None
 
-        # Proximity
+        # Threshold robustness: check if still valid under +/- small threshold shifts
+        if score_cf is None:
+            out["valid_robust"] = None
+        else:
+            checks = {}
+            for frac in self.cfg.thr_robust_fracs:
+                thr_low = thr * (1.0 - frac)
+                thr_high = thr * (1.0 + frac)
+                checks[f"valid_at_thr_minus_{frac:.0%}"] = bool(score_cf <= thr_low)
+                checks[f"valid_at_thr_plus_{frac:.0%}"] = bool(score_cf <= thr_high)
+            out["valid_robust"] = checks
+
+        # Delta and masks
+        d = x_cf - x0  # (L,F)
+        absd = d.abs()
+
+        # Changed masks
+        changed_tf = absd > self.cfg.eps_change  # (L,F)
+        changed_t = changed_tf.any(dim=1)  # (L,)
+        changed_f = changed_tf.any(dim=0)  # (F,)
+
+        # Change structure - time (segments)
+        out.update(_segment_stats_from_mask(changed_t))
+
+        # Change structure - feature/cell sparsity
+        L, F = x0.shape
+        out["n_changed_feat"] = int(changed_f.sum().item())
+        out["frac_changed_feat"] = float(changed_f.float().mean().item())
+        out["n_changed_cell"] = int(changed_tf.sum().item())
+        out["frac_changed_cell"] = float(changed_tf.float().mean().item())
+
+        # Edited span (for edited-only plausibility)
+        edited_span = _span_from_mask(changed_t)
+
+        # Proximity (raw)
         out["dist_rmse"] = float(_rmse(x0, x_cf).cpu().item())
         out["dist_mae"] = float(_mae(x0, x_cf).cpu().item())
         out["dist_max_abs"] = float(_max_abs(x0, x_cf).cpu().item())
+        out["dist_trimmed_rmse"] = float(
+            _trimmed_rmse(d, trim_q=self.cfg.trim_q).detach().cpu().item()
+        )
+        out["dist_trimmed_mae"] = float(
+            _trimmed_mean_abs(d, trim_q=self.cfg.trim_q).detach().cpu().item()
+        )
 
-        # Change structure (temporal contiguity)
-        delta = torch.abs(x_cf - x0)  # (L,F)
-        changed_t = (delta.max(dim=1).values > self.cfg.eps_change)  # (L,)
-        seg_stats = _segment_stats_from_mask(changed_t)
-        out.update(seg_stats)
+        # Per-feature proximity (raw)
+        per_rmse = torch.sqrt(torch.mean((d) ** 2, dim=0) + 1e-12)  # (F,)
+        per_mae = torch.mean(torch.abs(d), dim=0)  # (F,)
+        out["per_feature_rmse"] = [float(v) for v in per_rmse.detach().cpu().tolist()]
+        out["per_feature_mae"] = [float(v) for v in per_mae.detach().cpu().tolist()]
 
-        # Smoothness of edits (penalize jagged edits over time)
-        # computed on the delta (x_cf - x) so it measures edit smoothness, not signal smoothness
-        d = (x_cf - x0)  # (L,F)
+        # Top changed features by per_feature_rmse
+        if feature_names is None:
+            feature_names = [f"f{i}" for i in range(F)]
+        k = min(topk_features, F)
+        top_idx = (
+            torch.topk(per_rmse, k=k, largest=True).indices.detach().cpu().tolist()
+        )
+        out["top_changed_features"] = [
+            {
+                "feature": feature_names[i],
+                "rmse": float(per_rmse[i].detach().cpu().item()),
+                "mae": float(per_mae[i].detach().cpu().item()),
+            }
+            for i in top_idx
+        ]
+
+        # Proximity (scaled) if scaler available
+        if scaler_spec is not None:
+            x0s = scaler_spec.transform(x0)
+            xcfs = scaler_spec.transform(x_cf)
+            ds = xcfs - x0s
+            out["dist_rmse_scaled"] = float(_rmse(x0s, xcfs).cpu().item())
+            out["dist_mae_scaled"] = float(_mae(x0s, xcfs).cpu().item())
+            out["dist_trimmed_rmse_scaled"] = float(
+                _trimmed_rmse(ds, trim_q=self.cfg.trim_q).detach().cpu().item()
+            )
+            out["dist_trimmed_mae_scaled"] = float(
+                _trimmed_mean_abs(ds, trim_q=self.cfg.trim_q).detach().cpu().item()
+            )
+        else:
+            out["dist_rmse_scaled"] = None
+            out["dist_mae_scaled"] = None
+            out["dist_trimmed_rmse_scaled"] = None
+            out["dist_trimmed_mae_scaled"] = None
+
+        # Smoothness of edits (raw)
         if d.shape[0] >= 2:
             d1 = _diff1(d)
-            out["smooth_l2_d1"] = float(torch.sqrt(torch.mean(d1**2) + 1e-12).detach().cpu().item())
+            out["smooth_l2_d1"] = float(
+                torch.sqrt(torch.mean(d1**2) + 1e-12).detach().cpu().item()
+            )
+            out["tv_l1_d1"] = float(_tv_l1_first_diff(d).detach().cpu().item())
         else:
             out["smooth_l2_d1"] = 0.0
+            out["tv_l1_d1"] = 0.0
+
         if d.shape[0] >= 3:
             d2 = _diff2(d)
-            out["smooth_l2_d2"] = float(torch.sqrt(torch.mean(d2**2) + 1e-12).detach().cpu().item())
+            out["smooth_l2_d2"] = float(
+                torch.sqrt(torch.mean(d2**2) + 1e-12).detach().cpu().item()
+            )
         else:
             out["smooth_l2_d2"] = 0.0
+
+        out["boundary_discontinuity"] = _boundary_discontinuity(d, changed_t)
 
         # Budget / bookkeeping if present
         out["evals"] = _safe_float(meta.get("evals"))
         out["method"] = meta.get("method", meta.get("strategy", None))
 
-        # Plausibility (NormalCore)
+        # Plausibility metrics require normal_core
         if normal_core is None:
+            # keep plausibility keys explicit
             out["bounds_violations"] = None
             out["bounds_violation_frac"] = None
+            out["bounds_violations_edited"] = None
+            out["bounds_violation_frac_edited"] = None
             out["nn_dist_to_normal_core"] = None
+            out["nn_dist_to_normal_core_edited"] = None
             out["z_abs_mean"] = None
             out["z_abs_max"] = None
+            out["z_abs_mean_edited"] = None
+            out["z_abs_max_edited"] = None
+            out["robust_z_abs_mean"] = None
+            out["robust_z_abs_max"] = None
+            out["robust_z_abs_mean_edited"] = None
+            out["robust_z_abs_max_edited"] = None
+            out["mahal_mean"] = None
+            out["mahal_max"] = None
+            out["mahal_mean_edited"] = None
+            out["mahal_max_edited"] = None
             return out
 
         nc = _to_3d(normal_core).detach()
 
-        # Bounds violations using quantile bounds from NormalCore
+        # 1) Bounds violations (whole window + edited span)
         lo, hi = _feature_bounds_from_normal_core(
             nc,
             q_lo=self.cfg.bounds_q_lo,
             q_hi=self.cfg.bounds_q_hi,
         )
-        viol = (x_cf < lo) | (x_cf > hi)  # broadcasts (L,F) vs (F,)
+        viol = (x_cf < lo) | (x_cf > hi)  # (L,F)
         n_viol = int(viol.sum().item())
         out["bounds_violations"] = n_viol
         out["bounds_violation_frac"] = float(n_viol / max(1, int(x_cf.numel())))
 
-        # Nearest-neighbor distance to NormalCore
+        if edited_span is None:
+            out["bounds_violations_edited"] = 0
+            out["bounds_violation_frac_edited"] = 0.0
+        else:
+            t0, t1 = edited_span
+            viol_e = viol[t0 : t1 + 1]
+            n_viol_e = int(viol_e.sum().item())
+            out["bounds_violations_edited"] = n_viol_e
+            out["bounds_violation_frac_edited"] = float(
+                n_viol_e / max(1, int(viol_e.numel()))
+            )
+
+        # 2) Nearest-neighbor distance to NormalCore (whole + edited span)
         out["nn_dist_to_normal_core"] = _nn_plausibility_dist(
             x_cf=x_cf,
             normal_core=nc,
             metric=self.cfg.nn_metric,
             chunk=self.cfg.nn_chunk,
+            time_slice=None,
+        )
+        out["nn_dist_to_normal_core_edited"] = _nn_plausibility_dist(
+            x_cf=x_cf,
+            normal_core=nc,
+            metric=self.cfg.nn_metric,
+            chunk=self.cfg.nn_chunk,
+            time_slice=edited_span,
         )
 
-        # Z-score plausibility
-        out.update(_zscore_plausibility(x_cf=x_cf, normal_core=nc))
+        # 3) Z-score plausibility (mean/std) + robust z (MAD), whole + edited span
+        z_all = _zscore_plausibility(x_cf=x_cf, normal_core=nc, time_slice=None)
+        z_ed = _zscore_plausibility(x_cf=x_cf, normal_core=nc, time_slice=edited_span)
+        out["z_abs_mean"] = z_all["z_abs_mean"]
+        out["z_abs_max"] = z_all["z_abs_max"]
+        out["z_abs_mean_edited"] = z_ed["z_abs_mean"]
+        out["z_abs_max_edited"] = z_ed["z_abs_max"]
+
+        rz_all = _robust_z_mad(x_cf=x_cf, normal_core=nc, time_slice=None)
+        rz_ed = _robust_z_mad(x_cf=x_cf, normal_core=nc, time_slice=edited_span)
+        out["robust_z_abs_mean"] = rz_all["robust_z_abs_mean"]
+        out["robust_z_abs_max"] = rz_all["robust_z_abs_max"]
+        out["robust_z_abs_mean_edited"] = rz_ed["robust_z_abs_mean"]
+        out["robust_z_abs_max_edited"] = rz_ed["robust_z_abs_max"]
+
+        # 4) Correlation-aware plausibility: Mahalanobis, whole + edited span
+        mh_all = _mahalanobis_plausibility(x_cf=x_cf, normal_core=nc, time_slice=None)
+        mh_ed = _mahalanobis_plausibility(
+            x_cf=x_cf, normal_core=nc, time_slice=edited_span
+        )
+        out["mahal_mean"] = mh_all["mahal_mean"]
+        out["mahal_max"] = mh_all["mahal_max"]
+        out["mahal_mean_edited"] = mh_ed["mahal_mean"]
+        out["mahal_max_edited"] = mh_ed["mahal_max"]
 
         return out
 
@@ -322,22 +751,32 @@ class CounterfactualMetrics:
         cf_results: List[Optional[Dict[str, Any]]],
         threshold: float,
         normal_core: Optional[torch.Tensor] = None,
+        scaler: Optional[Union[ScalerSpec, Dict[str, Any]]] = None,
+        scaler_path: Optional[str] = None,
+        feature_names: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        xs: (B,L,F) or (L,F) with B inferred as 1
-        cf_results: list length B
-        """
         xs3 = _to_3d(xs) if xs.dim() != 2 else xs.unsqueeze(0)
         B = xs3.shape[0]
         if len(cf_results) != B:
             raise ValueError(f"cf_results length {len(cf_results)} != batch size {B}")
 
         return [
-            self.compute(xs3[i], cf_results[i], threshold=threshold, normal_core=normal_core)
+            self.compute(
+                xs3[i],
+                cf_results[i],
+                threshold=threshold,
+                normal_core=normal_core,
+                scaler=scaler,
+                scaler_path=scaler_path,
+                feature_names=feature_names,
+            )
             for i in range(B)
         ]
 
 
+# -----------------------------
+# Summaries and stability
+# -----------------------------
 def summarize_metrics(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Aggregates a list of per-sample metric dicts into summary stats.
@@ -369,25 +808,52 @@ def summarize_metrics(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
             "max": float(t.max().item()),
         }
 
+    # keys you likely want in your paper tables
     keys = [
         "found",
         "valid",
         "score_cf",
         "delta_score_to_thr",
+        "margin_to_thr",
         "dist_rmse",
         "dist_mae",
         "dist_max_abs",
-        "n_changed",
-        "frac_changed",
-        "n_segments",
-        "max_segment_len",
+        "dist_trimmed_rmse",
+        "dist_trimmed_mae",
+        "dist_rmse_scaled",
+        "dist_mae_scaled",
+        "dist_trimmed_rmse_scaled",
+        "dist_trimmed_mae_scaled",
+        "n_changed_time",
+        "frac_changed_time",
+        "n_segments_time",
+        "max_segment_len_time",
+        "n_changed_feat",
+        "frac_changed_feat",
+        "n_changed_cell",
+        "frac_changed_cell",
         "smooth_l2_d1",
         "smooth_l2_d2",
+        "tv_l1_d1",
+        "boundary_discontinuity",
         "bounds_violations",
         "bounds_violation_frac",
+        "bounds_violations_edited",
+        "bounds_violation_frac_edited",
         "nn_dist_to_normal_core",
+        "nn_dist_to_normal_core_edited",
         "z_abs_mean",
         "z_abs_max",
+        "z_abs_mean_edited",
+        "z_abs_max_edited",
+        "robust_z_abs_mean",
+        "robust_z_abs_max",
+        "robust_z_abs_mean_edited",
+        "robust_z_abs_max_edited",
+        "mahal_mean",
+        "mahal_max",
+        "mahal_mean_edited",
+        "mahal_max_edited",
         "evals",
     ]
 
@@ -407,7 +873,16 @@ def summarize_metrics(metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def stability_metrics(
     per_seed_metrics: List[Dict[str, Any]],
-    keys: Tuple[str, ...] = ("score_cf", "dist_rmse", "frac_changed", "n_segments"),
+    keys: Tuple[str, ...] = (
+        "score_cf",
+        "margin_to_thr",
+        "dist_rmse_scaled",
+        "frac_changed_time",
+        "frac_changed_feat",
+        "n_segments_time",
+        "nn_dist_to_normal_core_edited",
+        "mahal_mean_edited",
+    ),
 ) -> Dict[str, Any]:
     """
     per_seed_metrics: metrics computed for the SAME x but different seeds / runs.
