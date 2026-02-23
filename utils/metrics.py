@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 
@@ -905,3 +906,235 @@ def stability_metrics(
         mx = float(t.max().item())
         out[k] = {"var": var, "std": std, "min": mn, "max": mx, "range": float(mx - mn)}
     return out
+
+
+def _cmp_value(m: Dict[str, Any], key: str, default: float = float("inf")) -> float:
+    v = _safe_float(m.get(key))
+    if v is None:
+        return default
+    return float(v)
+
+
+def _sample_quality_tuple(
+    m: Dict[str, Any],
+    score_key: str,
+    prox_key: str,
+    sparsity_key: str,
+    plaus_key: Optional[str],
+) -> Tuple[float, float, float, float]:
+    valid = bool(m.get("valid", False))
+    invalid_flag = 0.0 if valid else 1.0
+    score = _cmp_value(m, score_key)
+    prox = _cmp_value(m, prox_key)
+    sparsity = _cmp_value(m, sparsity_key)
+    plaus = _cmp_value(m, plaus_key) if plaus_key else 0.0
+    return (invalid_flag, score, prox, sparsity + plaus)
+
+
+def compare_methods(
+    metrics_by_method: Dict[str, List[Dict[str, Any]]],
+    *,
+    score_key: str = "score_cf",
+    proximity_key: str = "dist_rmse",
+    sparsity_key: str = "frac_changed_time",
+    plausibility_key: Optional[str] = "nn_dist_to_normal_core_edited",
+) -> Dict[str, Any]:
+    """
+    Compare methods on aligned samples using lexicographic pairwise wins.
+    """
+    if not metrics_by_method:
+        return {
+            "methods": [],
+            "n_samples": 0,
+            "per_method_summary": {},
+            "wins": {},
+            "overall_win_rate": {},
+            "ranking": [],
+            "comparison_keys": {
+                "score_key": score_key,
+                "proximity_key": proximity_key,
+                "sparsity_key": sparsity_key,
+                "plausibility_key": plausibility_key,
+            },
+        }
+
+    methods = sorted(metrics_by_method.keys())
+    lengths = {m: len(metrics_by_method[m]) for m in methods}
+    n_samples = min(lengths.values()) if lengths else 0
+
+    per_method_summary = {m: summarize_metrics(metrics_by_method[m]) for m in methods}
+
+    wins: Dict[str, Dict[str, Dict[str, Any]]] = {m: {} for m in methods}
+    for i, mi in enumerate(methods):
+        for j, mj in enumerate(methods):
+            if i == j:
+                wins[mi][mj] = {"wins": 0, "comparisons": 0, "win_rate": None}
+                continue
+
+            w = 0
+            c = 0
+            for k in range(n_samples):
+                ai = metrics_by_method[mi][k]
+                bj = metrics_by_method[mj][k]
+                ta = _sample_quality_tuple(
+                    ai, score_key, proximity_key, sparsity_key, plausibility_key
+                )
+                tb = _sample_quality_tuple(
+                    bj, score_key, proximity_key, sparsity_key, plausibility_key
+                )
+                if ta < tb:
+                    w += 1
+                c += 1
+
+            wins[mi][mj] = {
+                "wins": int(w),
+                "comparisons": int(c),
+                "win_rate": (float(w / c) if c > 0 else None),
+            }
+
+    overall_win_rate: Dict[str, float] = {}
+    for mi in methods:
+        vals = []
+        for mj in methods:
+            if mi == mj:
+                continue
+            wr = wins[mi][mj]["win_rate"]
+            if wr is not None:
+                vals.append(float(wr))
+        overall_win_rate[mi] = float(sum(vals) / len(vals)) if vals else 0.0
+
+    ranking = sorted(
+        methods,
+        key=lambda m: (
+            -overall_win_rate[m],
+            -_cmp_value(per_method_summary[m], "valid_rate", default=-1.0),
+        ),
+    )
+
+    return {
+        "methods": methods,
+        "n_samples": int(n_samples),
+        "per_method_summary": per_method_summary,
+        "wins": wins,
+        "overall_win_rate": overall_win_rate,
+        "ranking": ranking,
+        "comparison_keys": {
+            "score_key": score_key,
+            "proximity_key": proximity_key,
+            "sparsity_key": sparsity_key,
+            "plausibility_key": plausibility_key,
+        },
+        "lengths_per_method": lengths,
+    }
+
+
+def estimate_difficulty_score_from_pareto(
+    pareto_objectives: List[List[float]],
+    threshold: float,
+) -> Optional[float]:
+    """
+    Difficulty proxy from Pareto front:
+    sqrt(min proximity objective f2 among points with f1 <= threshold).
+    """
+    if not pareto_objectives:
+        return None
+
+    thr = float(threshold)
+    vals: List[float] = []
+    for row in pareto_objectives:
+        if len(row) < 2:
+            continue
+        f1 = _safe_float(row[0])
+        f2 = _safe_float(row[1])
+        if f1 is None or f2 is None:
+            continue
+        if f1 <= thr:
+            vals.append(float(f2))
+
+    if not vals:
+        return None
+    return float(math.sqrt(max(min(vals), 0.0)))
+
+
+def genetic_stability_analysis(
+    explainer: Any,
+    x: Union[np.ndarray, torch.Tensor],
+    n_perturbations: int = 8,
+    perturb_eps: float = 0.01,
+    random_seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    S(x) style stability: compare CF(x) against CF(x + epsilon) across perturbations.
+    """
+    if n_perturbations < 1:
+        raise ValueError("n_perturbations must be >= 1")
+
+    if isinstance(x, torch.Tensor):
+        x_np = x.detach().cpu().numpy()
+    else:
+        x_np = np.asarray(x)
+    if x_np.ndim != 2:
+        raise ValueError(f"x must have shape (L,F), got {x_np.shape}")
+
+    rng = np.random.default_rng(int(random_seed))
+
+    def _extract_x_cf(res: Any) -> Optional[np.ndarray]:
+        if res is None:
+            return None
+        if isinstance(res, dict):
+            v = res.get("x_cf")
+        else:
+            v = getattr(res, "x_cf", None)
+        if v is None:
+            return None
+        if isinstance(v, torch.Tensor):
+            return v.detach().cpu().numpy()
+        return np.asarray(v)
+
+    def _stats(vals: List[float]) -> Dict[str, Optional[float]]:
+        if not vals:
+            return {"mean": None, "median": None, "min": None, "max": None}
+        arr = np.asarray(vals, dtype=np.float64)
+        return {
+            "mean": float(arr.mean()),
+            "median": float(np.median(arr)),
+            "min": float(arr.min()),
+            "max": float(arr.max()),
+        }
+
+    base_res = explainer.explain(x_np)
+    base_cf = _extract_x_cf(base_res)
+    if base_cf is None:
+        return {
+            "n_runs": int(n_perturbations),
+            "base_found": False,
+            "successful_runs": 0,
+            "distance_rmse": {"mean": None, "median": None, "min": None, "max": None},
+            "distance_mae": {"mean": None, "median": None, "min": None, "max": None},
+            "distances_rmse": [],
+            "distances_mae": [],
+        }
+
+    dist_rmse: List[float] = []
+    dist_mae: List[float] = []
+    for _ in range(int(n_perturbations)):
+        noise = rng.normal(0.0, float(perturb_eps), size=x_np.shape)
+        xp = x_np + noise
+        res_p = explainer.explain(xp)
+        cf_p = _extract_x_cf(res_p)
+        if cf_p is None or cf_p.shape != base_cf.shape:
+            continue
+
+        delta = cf_p - base_cf
+        dist_rmse.append(float(np.sqrt(np.mean(delta * delta) + 1e-12)))
+        dist_mae.append(float(np.mean(np.abs(delta))))
+
+    return {
+        "n_runs": int(n_perturbations),
+        "base_found": True,
+        "successful_runs": int(len(dist_rmse)),
+        "distance_rmse": _stats(dist_rmse),
+        "distance_mae": _stats(dist_mae),
+        "distances_rmse": dist_rmse,
+        "distances_mae": dist_mae,
+    }

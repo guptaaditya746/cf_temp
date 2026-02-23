@@ -41,6 +41,10 @@ class CounterfactualExplainer:
         self.n_generations = int(method_kwargs.pop("n_generations", 50))
         self.crossover_rate = float(method_kwargs.pop("crossover_rate", 0.9))
         self.mutation_rate = float(method_kwargs.pop("mutation_rate", 0.1))
+        self.mutation_sigma = float(method_kwargs.pop("mutation_sigma", 0.05))
+        self.use_smoothness_objective = bool(
+            method_kwargs.pop("use_smoothness_objective", False)
+        )
 
         self.method_kwargs = method_kwargs
 
@@ -70,7 +74,7 @@ class CounterfactualExplainer:
             return "normal_core must contain at least one window"
 
         if np.isnan(self.normal_core).any():
-            return "normal_core contains NaN values; v1.1 does not allow NaNs"
+            return "normal_core contains NaN values; v2.0 does not allow NaNs"
 
         if self.threshold is not None:
             try:
@@ -105,6 +109,8 @@ class CounterfactualExplainer:
             return "crossover_rate must be in [0, 1]"
         if not (0.0 <= self.mutation_rate <= 1.0):
             return "mutation_rate must be in [0, 1]"
+        if not (self.mutation_sigma > 0.0):
+            return "mutation_sigma must be > 0"
 
         if self.method_kwargs:
             bad = ", ".join(sorted(self.method_kwargs.keys()))
@@ -123,7 +129,7 @@ class CounterfactualExplainer:
             return f"x shape mismatch: expected {(core_L, core_F)}, got {(L, F)}"
 
         if np.isnan(x).any():
-            return "x contains NaN values; v1.1 does not allow NaNs"
+            return "x contains NaN values; v2.0 does not allow NaNs"
 
         return None
 
@@ -185,6 +191,8 @@ class CounterfactualExplainer:
                     n_generations=self.n_generations,
                     crossover_rate=self.crossover_rate,
                     mutation_rate=self.mutation_rate,
+                    mutation_sigma=self.mutation_sigma,
+                    use_smoothness_objective=self.use_smoothness_objective,
                     random_seed=self.random_seed,
                 )
 
@@ -195,7 +203,9 @@ class CounterfactualExplainer:
             )
         except Exception as exc:
             return CFFailure(
-                reason="optimization_failed" if self.method == "genetic" else "invalid_input",
+                reason="optimization_failed"
+                if self.method == "genetic"
+                else "invalid_input",
                 message=f"Counterfactual generation failed: {exc}",
                 diagnostics={"exception_type": type(exc).__name__},
             )

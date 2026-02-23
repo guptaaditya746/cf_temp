@@ -11,6 +11,25 @@ from cftsad.core.scoring import reconstruction_score
 from cftsad.types import CFFailure, CFResult
 
 
+def _reconstruct_with_model(model: object, x: np.ndarray) -> np.ndarray:
+    """
+    Reconstruct x using the model while tolerating (L,F)<->(1,L,F) conventions.
+    """
+    try:
+        y = model(x)
+    except Exception:
+        y = model(x[np.newaxis, ...])
+
+    y = np.asarray(y)
+    if y.shape == x.shape:
+        return y
+    if y.ndim == 3 and y.shape[0] == 1 and y.shape[1:] == x.shape:
+        return y[0]
+    raise ValueError(
+        f"Model reconstruction shape mismatch in genetic method: {y.shape} vs {x.shape}"
+    )
+
+
 def _constraint_violation(
     x_cf: np.ndarray,
     x_original: np.ndarray,
@@ -36,9 +55,18 @@ def _constraint_violation(
     return float(violation)
 
 
-def _sparsity_objective(x_cf: np.ndarray, x_original: np.ndarray, eps: float = 1e-8) -> float:
+def _sparsity_objective(
+    x_cf: np.ndarray, x_original: np.ndarray, eps: float = 1e-8
+) -> float:
     changed = np.any(np.abs(x_cf - x_original) > eps, axis=1)
     return float(np.mean(changed.astype(np.float64)))
+
+
+def _smoothness_objective(x_cf: np.ndarray) -> float:
+    if x_cf.shape[0] <= 1:
+        return 0.0
+    d1 = np.diff(x_cf, axis=0)
+    return float(np.sum(d1 * d1))
 
 
 def _evaluate_population(
@@ -47,9 +75,11 @@ def _evaluate_population(
     x_original: np.ndarray,
     immutable_features: tuple[int, ...],
     bounds: Dict[int, Tuple[float, float]],
+    include_smoothness_objective: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     n = population.shape[0]
-    objectives = np.zeros((n, 3), dtype=np.float64)
+    n_obj = 4 if include_smoothness_objective else 3
+    objectives = np.zeros((n, n_obj), dtype=np.float64)
     violations = np.zeros(n, dtype=np.float64)
 
     for i in range(n):
@@ -64,6 +94,8 @@ def _evaluate_population(
         diff = x_cf - x_original
         objectives[i, 1] = float(np.sum(diff * diff))
         objectives[i, 2] = _sparsity_objective(x_cf, x_original)
+        if include_smoothness_objective:
+            objectives[i, 3] = _smoothness_objective(x_cf)
 
     return objectives, violations
 
@@ -75,6 +107,8 @@ def _initialize_population(
     rng: np.random.Generator,
     immutable_features: tuple[int, ...],
     bounds: Dict[int, Tuple[float, float]],
+    model: object,
+    mutation_sigma: float,
 ) -> np.ndarray:
     L, F = x.shape
     pop = np.repeat(x[np.newaxis, :, :], population_size, axis=0)
@@ -82,14 +116,33 @@ def _initialize_population(
     core_std = np.std(normal_core.reshape(-1, F), axis=0)
     core_std = np.where(core_std < 1e-8, 1e-3, core_std)
 
-    for i in range(population_size):
-        noise_scale = rng.uniform(0.01, 0.2)
-        noise = rng.normal(0.0, 1.0, size=(L, F)) * core_std[np.newaxis, :] * noise_scale
+    # Seed with original.
+    pop[0] = np.array(x, copy=True)
+
+    # Seed with nearest donor.
+    if population_size >= 2:
+        dists = np.mean((normal_core - x[np.newaxis, :, :]) ** 2, axis=(1, 2))
+        donor_idx = int(np.argmin(dists))
+        donor = np.array(normal_core[donor_idx], copy=True)
+        pop[1] = apply_constraints(donor, x, immutable_features, bounds)
+
+    # Seed with reconstruction projection.
+    if population_size >= 3:
+        recon = _reconstruct_with_model(model, x)
+        pop[2] = apply_constraints(recon, x, immutable_features, bounds)
+
+    # Fill the rest with gaussian perturbations around x.
+    start_i = 3 if population_size >= 3 else population_size
+    sigma = max(float(mutation_sigma), 1e-8)
+    for i in range(start_i, population_size):
+        noise = rng.normal(0.0, 1.0, size=(L, F)) * (sigma * core_std[np.newaxis, :])
         candidate = x + noise
         candidate = apply_constraints(candidate, x, immutable_features, bounds)
         pop[i] = candidate
 
-    pop[0] = np.array(x, copy=True)
+    # If population_size is 1/2, ensure remaining slots are deterministic.
+    for i in range(population_size):
+        pop[i] = apply_constraints(pop[i], x, immutable_features, bounds)
     return pop
 
 
@@ -112,6 +165,7 @@ def _mutate(
     x_cf: np.ndarray,
     mutation_rate: float,
     normal_core: np.ndarray,
+    mutation_sigma: float,
     rng: np.random.Generator,
 ) -> np.ndarray:
     out = np.array(x_cf, copy=True)
@@ -120,7 +174,9 @@ def _mutate(
     core_std = np.where(core_std < 1e-8, 1e-3, core_std)
 
     mask = rng.random(size=(L, F)) < mutation_rate
-    noise = rng.normal(0.0, 1.0, size=(L, F)) * (0.05 * core_std[np.newaxis, :])
+    noise = rng.normal(0.0, 1.0, size=(L, F)) * (
+        float(mutation_sigma) * core_std[np.newaxis, :]
+    )
     out[mask] += noise[mask]
     return out
 
@@ -136,6 +192,8 @@ def generate_genetic(
     n_generations: int = 50,
     crossover_rate: float = 0.9,
     mutation_rate: float = 0.1,
+    mutation_sigma: float = 0.05,
+    use_smoothness_objective: bool = False,
     random_seed: int = 42,
 ) -> CFResult | CFFailure:
     t0 = time.perf_counter()
@@ -164,6 +222,8 @@ def generate_genetic(
         rng=rng,
         immutable_features=immutable_tuple,
         bounds=bounds_dict,
+        model=model,
+        mutation_sigma=float(mutation_sigma),
     )
 
     objectives, violations = _evaluate_population(
@@ -172,6 +232,7 @@ def generate_genetic(
         x,
         immutable_tuple,
         bounds_dict,
+        include_smoothness_objective=bool(use_smoothness_objective),
     )
 
     for _ in range(int(n_generations)):
@@ -193,8 +254,12 @@ def generate_genetic(
             p2 = mating_pool[i2]
 
             c1, c2 = _crossover(p1, p2, float(crossover_rate), rng)
-            c1 = _mutate(c1, float(mutation_rate), normal_core, rng)
-            c2 = _mutate(c2, float(mutation_rate), normal_core, rng)
+            c1 = _mutate(
+                c1, float(mutation_rate), normal_core, float(mutation_sigma), rng
+            )
+            c2 = _mutate(
+                c2, float(mutation_rate), normal_core, float(mutation_sigma), rng
+            )
 
             c1 = apply_constraints(c1, x, immutable_tuple, bounds_dict)
             c2 = apply_constraints(c2, x, immutable_tuple, bounds_dict)
@@ -209,6 +274,7 @@ def generate_genetic(
             x,
             immutable_tuple,
             bounds_dict,
+            include_smoothness_objective=bool(use_smoothness_objective),
         )
 
         keep_idx, _, _, _ = nsga2_select(
@@ -220,14 +286,19 @@ def generate_genetic(
         objectives = combined_obj[keep_idx]
         violations = combined_viol[keep_idx]
 
-    _, _, _, fronts = nsga2_select(objectives, violations, target_size=population.shape[0])
+    _, _, _, fronts = nsga2_select(
+        objectives, violations, target_size=population.shape[0]
+    )
     pareto_front = fronts[0] if fronts else []
 
     if not pareto_front:
         return CFFailure(
             reason="optimization_failed",
             message="No Pareto front could be produced.",
-            diagnostics={"population_size": int(population_size), "n_generations": int(n_generations)},
+            diagnostics={
+                "population_size": int(population_size),
+                "n_generations": int(n_generations),
+            },
         )
 
     pareto_idx = np.asarray(pareto_front, dtype=np.int64)
@@ -251,6 +322,10 @@ def generate_genetic(
     best_cf = pareto_pop[best_local]
     best_obj = pareto_obj[best_local]
     best_viol = pareto_viol[best_local]
+    valid_proximity = pareto_obj[valid_mask, 1] if np.any(valid_mask) else None
+    difficulty_score = (
+        float(np.sqrt(np.min(valid_proximity))) if valid_proximity is not None else None
+    )
 
     runtime_ms = (time.perf_counter() - t0) * 1000.0
     return CFResult(
@@ -258,17 +333,22 @@ def generate_genetic(
         score_cf=float(best_obj[0]),
         meta={
             "pareto_size": int(len(pareto_front)),
-            "best_objectives": {
-                "validity": float(best_obj[0]),
-                "proximity": float(best_obj[1]),
-                "sparsity": float(best_obj[2]),
-            },
+            "best_objectives": [float(v) for v in best_obj.tolist()],
+            "best_objective_names": (
+                ["validity", "proximity", "sparsity", "smoothness"]
+                if bool(use_smoothness_objective)
+                else ["validity", "proximity", "sparsity"]
+            ),
+            "difficulty_score": difficulty_score,
             "generations": int(n_generations),
             "population_size": int(population_size),
+            "constraint_violation": float(best_viol),
             "constraint_violations": float(best_viol),
             "runtime_ms": runtime_ms,
             "warning": warning,
             "threshold": float(threshold),
             "valid": bool(best_obj[0] <= float(threshold)),
+            "mutation_sigma": float(mutation_sigma),
+            "random_seed": int(random_seed),
         },
     )

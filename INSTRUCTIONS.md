@@ -1,5 +1,15 @@
-Below is the updated **`INSTRUCTIONS.md`** including the **Genetic (NSGA-II) multi-objective optimization approach**.
-This defines the architecture, objectives, constraints, and API rules clearly for a public release.
+Below is your **updated and production-ready `INSTRUCTIONS.md`** including:
+
+* **COMTE (Segment Substitution)**
+* **Generative (Mask + Infilling)**
+* Unified MSE scoring
+* Constraints
+* Clear API contract
+* Deterministic + stochastic behavior definitions
+
+This version assumes you are shipping:
+
+> nearest, comte, generative, motif, genetic (optional)
 
 ---
 
@@ -7,31 +17,33 @@ This defines the architecture, objectives, constraints, and API rules clearly fo
 
 ## Counterfactual Explanations for Time-Series Anomaly Detection
 
-### MSE-Based Scoring + Genetic Multi-Objective Optimization (v1.1)
+### Reconstruction-Based Models (MSE Scoring) — v1.2
 
 ---
 
-# 1. Project Goal
+# 1. Project Objective
 
-This library generates **counterfactual explanations** for reconstruction-based time-series anomaly detection models.
+This library provides **counterfactual explanations** for reconstruction-based time-series anomaly detection models.
 
 Given:
 
 * A trained reconstruction model
 * An anomalous window ( x \in \mathbb{R}^{L \times F} )
-* A normal core (set of normal windows)
+* A set of normal windows (normal core)
 
-The library returns:
+The system generates:
 
-> A minimally modified version of ( x ) whose reconstruction MSE falls below a threshold, while preserving realism and temporal coherence.
+> A minimally modified version of ( x ) such that its reconstruction MSE falls below a defined anomaly threshold, while preserving temporal coherence and realism.
 
 ---
 
-# 2. Unified Scoring (Mandatory Across All Methods)
+# 2. Unified Anomaly Scoring (MANDATORY)
 
-All methods MUST use the same anomaly score:
+All methods MUST use the same anomaly score.
 
-### Reconstruction MSE Score
+## 2.1 Reconstruction MSE
+
+For input ( x ) and reconstruction ( \hat{x} ):
 
 Per timestep:
 [
@@ -47,7 +59,8 @@ This score defines:
 
 * Anomaly detection
 * Counterfactual validity
-* Optimization target (for genetic)
+* Optimization objective (genetic)
+* Candidate ranking (comte + generative)
 
 ---
 
@@ -59,10 +72,10 @@ A counterfactual is valid if:
 \text{score}(x_{cf}) \le \text{threshold}
 ]
 
-Where threshold is:
+Threshold is:
 
-* User-provided, OR
-* Estimated from normal core (default 95% quantile)
+* User-provided OR
+* Computed from normal core (default: 95th percentile)
 
 ---
 
@@ -72,8 +85,14 @@ Where threshold is:
 
 ```python
 CounterfactualExplainer(
-    method: Literal["nearest", "segment", "motif", "genetic"],
-    model: callable or torch module,
+    method: Literal[
+        "nearest",
+        "comte",
+        "generative",
+        "motif",
+        "genetic"
+    ],
+    model,
     normal_core: np.ndarray,  # shape (K, L, F)
     threshold: Optional[float] = None,
     **method_kwargs
@@ -82,18 +101,16 @@ CounterfactualExplainer(
 
 ---
 
-## 4.2 Input Format
+## 4.2 Input Requirements
 
 * Single window only
-* Shape: `(L, F)`
-* Type: `numpy.ndarray`
-* No NaNs (v1.1)
+* Shape `(L, F)`
+* Type `np.ndarray`
+* No NaN (v1.2)
 
 ---
 
-## 4.3 Output Format
-
-All methods MUST return:
+## 4.3 Output Types
 
 ### Success
 
@@ -121,206 +138,250 @@ Never return `None`.
 
 ---
 
-# 5.1 Nearest Neighbour
+# 5.1 COMTE — Segment Substitution
 
-* Replace full window with closest normal window.
-* Distance metric: MSE.
-* Deterministic.
+## Concept
 
----
+COMTE replaces only the anomalous segment using a matched normal donor segment from the normal core.
 
-# 5.2 Segment Substitution
+It is:
 
-* Detect anomalous segment.
-* Replace with segment from nearest donor.
-* Optional boundary smoothing.
-* Deterministic.
+* Deterministic
+* Interpretable
+* Data-driven
+* Realistic (uses real normal data)
 
 ---
 
-# 5.3 Motif-Based Substitution
+## 5.1.1 Pipeline
 
-* Detect anomalous segment.
-* Retrieve similar motifs from normal core.
-* Replace only segment.
-* Deterministic.
+### Step 1 — Candidate Segment Detection
 
----
-
-# 5.4 Genetic Multi-Objective Optimization (NSGA-II)
-
-## Purpose
-
-Instead of copying from existing normal data, this method **optimizes the input window directly in continuous space** to find a minimal modification that makes it normal.
+1. Compute per-timestep error ( e_t )
+2. Select top 10% highest-error timesteps
+3. Extract largest contiguous block
+4. Apply ±2 padding
+5. Enforce minimum length = max(5, L//20)
 
 ---
 
-# 6. Genetic Approach Design
+### Step 2 — Normal Core Matching
 
----
-
-## 6.1 Representation
-
-Each individual in the population represents:
+Select donor window:
 
 [
-x_{cf} \in \mathbb{R}^{L \times F}
+\text{donor} = \arg\min_k |x - x_k^{normal}|^2
 ]
 
-Optimization happens directly in input space.
+Matching may use:
+
+* Whole-window MSE
+* Segment-only MSE (optional extension)
 
 ---
 
-## 6.2 Multi-Objective Optimization (NSGA-II)
+### Step 3 — Segment Substitution
 
-We optimize:
-
-### Objective 1 — Validity (Minimize anomaly score)
+Replace:
 
 [
-f_1 = \text{score}(x_{cf})
+x_{cf}[s:e] = x_{donor}[s:e]
 ]
 
-### Objective 2 — Proximity (Minimize distance to original)
+Optional:
+
+* Boundary smoothing
+* Blending window edges
+
+---
+
+### Step 4 — Constraint Enforcement
+
+Apply:
+
+* Immutable features
+* Value bounds
+
+---
+
+### Step 5 — Validation
+
+Compute new score.
+
+If:
+
+* score <= threshold → valid
+* else → try next donor (if enabled)
+* else → failure
+
+---
+
+## 5.1.2 Meta Fields
+
+* segment_start
+* segment_end
+* donor_idx
+* score_before
+* score_after
+* smoothing_used
+* attempts
+
+---
+
+# 5.2 Generative — Mask + Infilling
+
+## Concept
+
+Instead of copying from normal data, this method:
+
+* Masks anomalous region
+* Uses reconstruction model (or auxiliary infilling engine)
+* Generates new values conditioned on surrounding context
+
+This allows more flexible transformations than COMTE.
+
+---
+
+# 5.2.1 Mask Strategy
+
+Mask is determined by:
+
+1. Per-timestep error ranking
+2. Contiguous segment extraction
+3. Optional multiple mask schedules
+4. Immutable features excluded from masking
+
+Mask is binary:
 
 [
-f_2 = | x_{cf} - x |_2^2
+M_t =
+\begin{cases}
+1 & \text{masked (to modify)} \
+0 & \text{keep original}
+\end{cases}
 ]
 
-### Objective 3 — Sparsity (Encourage minimal edits)
+---
+
+# 5.2.2 Infilling Engine
+
+Infilling can be:
+
+* Reconstruction-based (AE reconstruction over masked region)
+* Denoising-style infill
+* Iterative refinement
+
+Minimum v1.2 requirement:
+
+* Replace masked region with model reconstruction
 
 [
-f_3 = \frac{\text{number of modified timesteps}}{L}
+x_{cf} = (1-M) \cdot x + M \cdot \hat{x}
 ]
 
-Optional (future):
+---
 
-* Smoothness penalty
-* Spectral deviation
-* PCA manifold distance
+# 5.2.3 Candidate Selection
+
+Multiple mask strategies may be attempted:
+
+* Small mask
+* Expanded mask
+* Progressive widening
+
+Best candidate chosen based on:
+
+* Validity (score <= threshold)
+* Minimal proximity
+* Fewest masked timesteps
 
 ---
 
-## 6.3 Hard Constraints (Mandatory)
+# 5.2.4 Constraint Handling
 
-Genetic individuals must satisfy:
+After infilling:
 
-* Immutable features unchanged
-* Value bounds respected
-* Optional physical constraints
-
-Constraint violations increase feasibility penalty.
+* Apply immutable features
+* Clip bounds
+* Optional smoothing
 
 ---
 
-## 6.4 Soft Constraints (Optional Extension)
+# 5.2.5 Failure Cases
 
-Can include:
+Return failure if:
 
-* Temporal smoothness penalty
-* PCA coupling preservation
-* Spectral consistency
-
-These influence Pareto ranking but do not hard-reject individuals.
-
----
-
-## 6.5 Evolutionary Process
-
-1. Initialize population around original window.
-2. Evaluate objectives.
-3. Apply NSGA-II:
-
-   * Non-dominated sorting
-   * Crowding distance
-4. Apply crossover.
-5. Apply mutation.
-6. Repeat for `n_gen` generations.
+* No masks found
+* All masks exceed threshold
+* Over-masking
+* Reconstruction collapses (flatline)
 
 ---
 
-## 6.6 Selection of Final Counterfactual
+## 5.2.6 Meta Fields
 
-From Pareto front:
-
-Select solution satisfying:
-
-* score <= threshold
-* minimal proximity
-
-If none satisfy threshold:
-Return best compromise with warning in meta.
+* mask_size
+* mask_start
+* mask_end
+* attempts
+* score_before
+* score_after
+* best_mask_ratio
 
 ---
 
-## 6.7 Genetic Hyperparameters (Public)
+# 5.3 Comparison: COMTE vs Generative
 
-```python
-population_size = 100
-n_generations = 50
-crossover_rate = 0.9
-mutation_rate = 0.1
-seed = 42
-```
-
-Expose these via `method_kwargs`.
+| Aspect           | COMTE                | Generative                |
+| ---------------- | -------------------- | ------------------------- |
+| Source of values | Real normal data     | Model-generated           |
+| Deterministic    | Yes                  | Possibly stochastic       |
+| Realism          | Strong (data-driven) | Depends on model          |
+| Flexibility      | Limited to core      | Can create new patterns   |
+| Failure mode     | No good donor        | Model reconstruction weak |
 
 ---
 
-## 6.8 Meta Fields (Genetic)
+# 6. Constraints (v1.2)
 
-* pareto_size
-* best_objectives
-* generations
-* population_size
-* constraint_violations
-* runtime_ms
-
----
-
-# 7. Threshold Handling
-
-If threshold is None:
-
-1. Compute score for each normal_core window.
-2. Set threshold = 95% quantile.
-
----
-
-# 8. Constraints (v1.1)
-
-## 8.1 Immutable Features
-
-User may specify:
+## 6.1 Immutable Features
 
 ```python
 immutable_features = [2, 5]
 ```
 
-These must remain unchanged.
+These columns remain unchanged.
 
 ---
 
-## 8.2 Value Bounds
+## 6.2 Value Bounds
 
 ```python
 bounds = {feature_index: (min_val, max_val)}
 ```
 
-Applied to all methods.
+Clipping mandatory.
 
 ---
 
-## 8.3 Genetic Feasibility Handling
+## 6.3 Future Extensions (Not Required in v1.2)
 
-If constraint violated:
-
-* Hard constraint → reject individual
-* Soft constraint → penalty added
+* PCA manifold constraint
+* Spectral constraint
+* Temporal smoothness regularization
 
 ---
 
-# 9. Package Structure
+# 7. Threshold Estimation
+
+If threshold is None:
+
+1. Compute score for each normal_core window.
+2. Set threshold = quantile(scores, 0.95).
+
+---
+
+# 8. Package Structure
 
 ```
 src/cftsad/
@@ -329,44 +390,25 @@ src/cftsad/
     types.py
     methods/
         nearest.py
-        segment.py
+        comte.py
+        generative.py
         motif.py
         genetic.py
     core/
         scoring.py
         constraints.py
         distances.py
-        evolution.py
+        masking.py
 ```
 
 ---
 
-# 10. Computational Complexity
+# 9. Determinism Policy
 
-| Method  | Complexity                |
-| ------- | ------------------------- |
-| Nearest | O(KLF)                    |
-| Segment | O(KLF)                    |
-| Motif   | O(K * motif_count)        |
-| Genetic | O(pop * gen * model_eval) |
-
-Genetic is significantly more expensive.
-
----
-
-# 11. Error Handling
-
-Possible failure reasons:
-
-* invalid_input
-* no_valid_cf
-* constraint_violation
-* optimization_failed
-* segment_detection_failed
-
----
-
-# 12. Reproducibility
+* nearest → deterministic
+* comte → deterministic
+* generative → stochastic if sampling used
+* genetic → stochastic
 
 All stochastic methods MUST expose:
 
@@ -378,64 +420,81 @@ Default = 42.
 
 ---
 
-# 13. Version Scope
+# 10. Error Handling
 
-v1.1 includes:
+Possible failure reasons:
 
-* Nearest
-* Segment
-* Motif
-* Genetic (NSGA-II)
-* MSE scoring
-* Hard constraints
-
-Future versions may add:
-
-* Generative infilling
-* Diffusion models
-* Advanced manifold constraints
-* Batch inference
-* GPU optimization support
+* invalid_input
+* no_valid_cf
+* mask_generation_failed
+* donor_not_found
+* constraint_violation
+* reconstruction_failed
 
 ---
 
-# 14. Minimal Usage Example
+# 11. Computational Complexity
+
+| Method     | Complexity                    |
+| ---------- | ----------------------------- |
+| Nearest    | O(KLF)                        |
+| COMTE      | O(KLF)                        |
+| Generative | O(mask_variants * model_eval) |
+| Genetic    | O(pop * gen * model_eval)     |
+
+---
+
+# 12. Usage Example (Generative)
 
 ```python
-import numpy as np
-from cftsad import CounterfactualExplainer
-
-model = lambda x: x  # replace with real reconstructor
-core = np.load("normal_core.npy")
-x = np.load("window.npy")
-
 explainer = CounterfactualExplainer(
-    method="genetic",
+    method="generative",
     model=model,
     normal_core=core,
     threshold=None,
-    population_size=100,
-    n_generations=50,
+    max_mask_ratio=0.3,
 )
 
 result = explainer.explain(x)
-
 print(result.score_cf)
 ```
 
 ---
 
-# 15. Philosophy
+# 13. Usage Example (COMTE)
+
+```python
+explainer = CounterfactualExplainer(
+    method="comte",
+    model=model,
+    normal_core=core,
+    threshold=None,
+)
+
+result = explainer.explain(x)
+print(result.score_cf)
+```
+
+---
+
+# 14. Philosophy
 
 This library unifies:
 
-* Deterministic counterfactuals (nearest, segment, motif)
-* Optimization-based counterfactuals (genetic)
-* Consistent scoring
-* Clear validity definition
-* Strict API contract
+* Data-driven counterfactuals (COMTE)
+* Model-driven counterfactuals (Generative)
+* Optimization-driven counterfactuals (Genetic)
 
-The genetic method provides flexibility when no suitable donor exists, while deterministic methods ensure speed and interpretability.
+All under:
+
+* A single scoring rule
+* A single API contract
+* Clear validity definition
+* Stable package structure
+
+The COMTE method ensures realism through normal-core substitution.
+The Generative method allows flexible adaptation beyond available normal samples.
+The Genetic method enables continuous optimization when discrete substitution fails.
 
 ---
 
