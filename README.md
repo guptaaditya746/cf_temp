@@ -13,10 +13,12 @@ core = np.load("normal_core.npy")
 x = np.load("window.npy")
 
 explainer = CounterfactualExplainer(
-    method="segment",
+    method="genetic",
     model=model,
     normal_core=core,
     threshold=None,
+    population_size=100,
+    n_generations=50,
 )
 
 result = explainer.explain(x)

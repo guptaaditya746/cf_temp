@@ -1,39 +1,37 @@
-Below is a **production-ready `INSTRUCTIONS.md`** file you can place in the root of your repository.
-It defines architecture, API contract, scoring, method behaviour, constraints, and packaging rules for your first public release.
+Below is the updated **`INSTRUCTIONS.md`** including the **Genetic (NSGA-II) multi-objective optimization approach**.
+This defines the architecture, objectives, constraints, and API rules clearly for a public release.
 
 ---
 
 # INSTRUCTIONS.md
 
-## Counterfactual Explanations for Time-Series Anomaly Detection (MSE-based Release v1.0)
+## Counterfactual Explanations for Time-Series Anomaly Detection
+
+### MSE-Based Scoring + Genetic Multi-Objective Optimization (v1.1)
 
 ---
 
 # 1. Project Goal
 
-This package provides **counterfactual explanations** for reconstruction-based time-series anomaly detection models.
+This library generates **counterfactual explanations** for reconstruction-based time-series anomaly detection models.
 
 Given:
 
 * A trained reconstruction model
 * An anomalous window ( x \in \mathbb{R}^{L \times F} )
-* A set of normal windows (normal core)
+* A normal core (set of normal windows)
 
-The library generates:
+The library returns:
 
-> A minimally modified version of ( x ) such that its reconstruction MSE is below a defined anomaly threshold.
+> A minimally modified version of ( x ) whose reconstruction MSE falls below a threshold, while preserving realism and temporal coherence.
 
 ---
 
-# 2. Core Design Principles
-
-### 2.1 Unified Scoring (Mandatory)
+# 2. Unified Scoring (Mandatory Across All Methods)
 
 All methods MUST use the same anomaly score:
 
-### Window MSE Score
-
-For input window ( x ) and reconstruction ( \hat{x} ):
+### Reconstruction MSE Score
 
 Per timestep:
 [
@@ -47,56 +45,55 @@ Window score:
 
 This score defines:
 
-* Anomaly decision
-* Optimization target
-* Counterfactual validity condition
+* Anomaly detection
+* Counterfactual validity
+* Optimization target (for genetic)
 
 ---
 
-### 2.2 Valid Counterfactual Definition
+# 3. Valid Counterfactual Definition
 
 A counterfactual is valid if:
 
-```
-score(x_cf) <= threshold
-```
+[
+\text{score}(x_{cf}) \le \text{threshold}
+]
 
-Where threshold is either:
+Where threshold is:
 
-* Provided explicitly by user
-* Or computed from normal core quantile (default 95%)
+* User-provided, OR
+* Estimated from normal core (default 95% quantile)
 
 ---
 
-# 3. Public API Contract
+# 4. Public API Contract
 
-The public interface MUST remain stable.
-
-## 3.1 Entry Class
+## 4.1 Entry Class
 
 ```python
 CounterfactualExplainer(
-    method: Literal["nearest", "segment", "motif"],
+    method: Literal["nearest", "segment", "motif", "genetic"],
     model: callable or torch module,
     normal_core: np.ndarray,  # shape (K, L, F)
     threshold: Optional[float] = None,
+    **method_kwargs
 )
 ```
 
 ---
 
-## 3.2 Input Format
+## 4.2 Input Format
 
 * Single window only
 * Shape: `(L, F)`
 * Type: `numpy.ndarray`
-* No NaN allowed (v1)
+* No NaNs (v1.1)
 
 ---
 
-## 3.3 Output Format
+## 4.3 Output Format
 
-Every method MUST return one of:
+All methods MUST return:
 
 ### Success
 
@@ -120,121 +117,179 @@ Never return `None`.
 
 ---
 
-# 4. Implemented Methods (v1)
+# 5. Implemented Methods
 
 ---
 
-# 4.1 Method 1 — Nearest Neighbour
+# 5.1 Nearest Neighbour
 
-## Description
+* Replace full window with closest normal window.
+* Distance metric: MSE.
+* Deterministic.
 
-Select closest normal window from normal core.
+---
 
-## Algorithm
+# 5.2 Segment Substitution
 
-1. Compute distance between x and each normal window.
-2. Select argmin.
-3. Apply constraints.
-4. Compute score.
-5. Return.
+* Detect anomalous segment.
+* Replace with segment from nearest donor.
+* Optional boundary smoothing.
+* Deterministic.
 
-## Distance Metric
+---
 
-MSE distance between windows.
+# 5.3 Motif-Based Substitution
 
-## Meta Fields
+* Detect anomalous segment.
+* Retrieve similar motifs from normal core.
+* Replace only segment.
+* Deterministic.
 
-* donor_idx
-* donor_distance
-* score_before
-* score_after
+---
+
+# 5.4 Genetic Multi-Objective Optimization (NSGA-II)
+
+## Purpose
+
+Instead of copying from existing normal data, this method **optimizes the input window directly in continuous space** to find a minimal modification that makes it normal.
+
+---
+
+# 6. Genetic Approach Design
+
+---
+
+## 6.1 Representation
+
+Each individual in the population represents:
+
+[
+x_{cf} \in \mathbb{R}^{L \times F}
+]
+
+Optimization happens directly in input space.
+
+---
+
+## 6.2 Multi-Objective Optimization (NSGA-II)
+
+We optimize:
+
+### Objective 1 — Validity (Minimize anomaly score)
+
+[
+f_1 = \text{score}(x_{cf})
+]
+
+### Objective 2 — Proximity (Minimize distance to original)
+
+[
+f_2 = | x_{cf} - x |_2^2
+]
+
+### Objective 3 — Sparsity (Encourage minimal edits)
+
+[
+f_3 = \frac{\text{number of modified timesteps}}{L}
+]
+
+Optional (future):
+
+* Smoothness penalty
+* Spectral deviation
+* PCA manifold distance
+
+---
+
+## 6.3 Hard Constraints (Mandatory)
+
+Genetic individuals must satisfy:
+
+* Immutable features unchanged
+* Value bounds respected
+* Optional physical constraints
+
+Constraint violations increase feasibility penalty.
+
+---
+
+## 6.4 Soft Constraints (Optional Extension)
+
+Can include:
+
+* Temporal smoothness penalty
+* PCA coupling preservation
+* Spectral consistency
+
+These influence Pareto ranking but do not hard-reject individuals.
+
+---
+
+## 6.5 Evolutionary Process
+
+1. Initialize population around original window.
+2. Evaluate objectives.
+3. Apply NSGA-II:
+
+   * Non-dominated sorting
+   * Crowding distance
+4. Apply crossover.
+5. Apply mutation.
+6. Repeat for `n_gen` generations.
+
+---
+
+## 6.6 Selection of Final Counterfactual
+
+From Pareto front:
+
+Select solution satisfying:
+
+* score <= threshold
+* minimal proximity
+
+If none satisfy threshold:
+Return best compromise with warning in meta.
+
+---
+
+## 6.7 Genetic Hyperparameters (Public)
+
+```python
+population_size = 100
+n_generations = 50
+crossover_rate = 0.9
+mutation_rate = 0.1
+seed = 42
+```
+
+Expose these via `method_kwargs`.
+
+---
+
+## 6.8 Meta Fields (Genetic)
+
+* pareto_size
+* best_objectives
+* generations
+* population_size
+* constraint_violations
 * runtime_ms
 
 ---
 
-# 4.2 Method 2 — Segment Substitution
+# 7. Threshold Handling
 
-## Description
+If threshold is None:
 
-Replace only anomalous segment with corresponding part from donor window.
-
-## Segment Detection (Mandatory v1 Rule)
-
-1. Compute per-timestep error ( e_t )
-2. Select top 10% timesteps
-3. Extract largest contiguous region
-4. Apply ±2 padding
-5. Enforce minimum length = max(5, L//20)
+1. Compute score for each normal_core window.
+2. Set threshold = 95% quantile.
 
 ---
 
-## Pipeline
+# 8. Constraints (v1.1)
 
-1. Detect anomalous segment
-2. Select nearest donor
-3. Replace segment
-4. Apply smoothing (optional)
-5. Apply constraints
-6. Compute score
-7. Return
-
----
-
-## Meta Fields
-
-* segment_start
-* segment_end
-* donor_idx
-* score_before
-* score_after
-* smoothing_used
-
----
-
-# 4.3 Method 3 — Motif-Based Substitution
-
-## Description
-
-Replace anomalous segment using motif-level matching instead of full-window donor.
-
----
-
-## Motif Index Construction
-
-From normal core:
-
-1. Extract sliding subsegments of length m
-2. Z-normalize each subsegment
-3. Flatten into vector
-4. Store in motif index
-
----
-
-## Motif Retrieval
-
-1. Detect anomalous segment
-2. Z-normalize segment
-3. Retrieve top-k motifs by Euclidean distance
-4. Replace segment
-5. Apply constraints
-6. Compute score
-7. Return best candidate
-
----
-
-## Meta Fields
-
-* motif_length
-* topk_distances
-* chosen_motif_source
-* score_before
-* score_after
-
----
-
-# 5. Constraints (v1 Minimal Set)
-
-## 5.1 Immutable Features
+## 8.1 Immutable Features
 
 User may specify:
 
@@ -242,39 +297,30 @@ User may specify:
 immutable_features = [2, 5]
 ```
 
-These columns MUST remain unchanged.
+These must remain unchanged.
 
 ---
 
-## 5.2 Value Clipping (Optional)
-
-User may specify bounds:
+## 8.2 Value Bounds
 
 ```python
 bounds = {feature_index: (min_val, max_val)}
 ```
 
-Counterfactual values MUST be clipped.
+Applied to all methods.
 
 ---
 
-No PCA, PSD, DTW, or soft constraints in v1.
+## 8.3 Genetic Feasibility Handling
+
+If constraint violated:
+
+* Hard constraint → reject individual
+* Soft constraint → penalty added
 
 ---
 
-# 6. Threshold Handling
-
-If threshold is None:
-
-1. Compute score for each normal_core window
-2. Set:
-   [
-   threshold = quantile(scores, 0.95)
-   ]
-
----
-
-# 7. Package Structure (Mandatory)
+# 9. Package Structure
 
 ```
 src/cftsad/
@@ -285,109 +331,91 @@ src/cftsad/
         nearest.py
         segment.py
         motif.py
+        genetic.py
     core/
         scoring.py
         constraints.py
         distances.py
+        evolution.py
 ```
 
-Use `src/` layout.
+---
+
+# 10. Computational Complexity
+
+| Method  | Complexity                |
+| ------- | ------------------------- |
+| Nearest | O(KLF)                    |
+| Segment | O(KLF)                    |
+| Motif   | O(K * motif_count)        |
+| Genetic | O(pop * gen * model_eval) |
+
+Genetic is significantly more expensive.
 
 ---
 
-# 8. Model Integration Rules
+# 11. Error Handling
 
-The model may be:
+Possible failure reasons:
 
-* Callable: `model(x: np.ndarray) -> np.ndarray`
-* Or torch module
-
-Internally:
-
-* Convert numpy to torch if needed
-* Always return numpy
-
-The public API MUST remain numpy-based.
+* invalid_input
+* no_valid_cf
+* constraint_violation
+* optimization_failed
+* segment_detection_failed
 
 ---
 
-# 9. Performance Guidelines
+# 12. Reproducibility
 
-* Nearest: O(KLF)
-* Segment: O(KLF)
-* Motif: O(K * motif_count)
+All stochastic methods MUST expose:
 
-Recommended:
+```python
+random_seed
+```
 
-* K <= 500
-* Window length <= 300 for public demo
-
----
-
-# 10. Error Handling
-
-Reject if:
-
-* Input shape mismatch
-* NaNs present
-* Normal core shape inconsistent
-* Threshold invalid
-
-Return `CFFailure` with reason codes:
-
-* "invalid_input"
-* "no_valid_cf"
-* "constraint_violation"
-* "segment_detection_failed"
+Default = 42.
 
 ---
 
-# 11. Reproducibility
+# 13. Version Scope
 
-If randomness used:
-
-* Provide `random_seed` parameter
-* Default = 42
-
----
-
-# 12. Version Policy
-
-v1.0 includes only:
+v1.1 includes:
 
 * Nearest
 * Segment
 * Motif
+* Genetic (NSGA-II)
 * MSE scoring
-* Minimal constraints
+* Hard constraints
 
 Future versions may add:
 
 * Generative infilling
-* Genetic optimization
-* PCA / spectral constraints
-* Multivariate DTW
+* Diffusion models
+* Advanced manifold constraints
 * Batch inference
+* GPU optimization support
 
 ---
 
-# 13. README Example (Mandatory)
-
-Provide minimal example:
+# 14. Minimal Usage Example
 
 ```python
 import numpy as np
 from cftsad import CounterfactualExplainer
 
-model = lambda x: x  # replace with real model
+model = lambda x: x  # replace with real reconstructor
 core = np.load("normal_core.npy")
 x = np.load("window.npy")
 
 explainer = CounterfactualExplainer(
-    method="segment",
+    method="genetic",
     model=model,
     normal_core=core,
     threshold=None,
+    population_size=100,
+    n_generations=50,
 )
 
 result = explainer.explain(x)
@@ -397,17 +425,17 @@ print(result.score_cf)
 
 ---
 
-# 14. Philosophy
+# 15. Philosophy
 
-This library prioritizes:
+This library unifies:
 
-* Stability
-* Simplicity
-* Reproducibility
-* Clear method separation
+* Deterministic counterfactuals (nearest, segment, motif)
+* Optimization-based counterfactuals (genetic)
 * Consistent scoring
+* Clear validity definition
+* Strict API contract
 
-Heavy optimization and advanced constraints are intentionally excluded from v1 to ensure reliability and usability.
+The genetic method provides flexibility when no suitable donor exists, while deterministic methods ensure speed and interpretability.
 
 ---
 
