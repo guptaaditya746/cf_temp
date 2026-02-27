@@ -7,6 +7,7 @@ import numpy as np
 
 from cftsad.core.candidates import compute_candidate_metrics, rank_candidates
 from cftsad.core.constraints import apply_constraints
+from cftsad.core.constraints_v2 import apply_constraints_v2
 from cftsad.core.postprocess import build_explainability_meta
 from cftsad.core.scoring import reconstruction_score
 from cftsad.methods.segment import detect_candidate_segments
@@ -80,6 +81,9 @@ def generate_motif(
     length_factors: tuple[float, ...] = (0.75, 1.0, 1.25),
     context_weight: float = 0.2,
     use_affine_fit: bool = True,
+    use_constraints_v2: bool = False,
+    max_delta_per_step: float | None = None,
+    relational_linear: Dict[str, tuple[int, int, float]] | None = None,
 ) -> CFResult | CFFailure:
     t0 = time.perf_counter()
     score_before = reconstruction_score(model, x)
@@ -109,6 +113,8 @@ def generate_motif(
     all_candidates = []
     attempted = 0
     motif_lengths = set()
+    best_constraint_violation = np.inf
+    best_constraint_breakdown = None
 
     for start, end in segment_candidates:
         motif_length = end - start + 1
@@ -143,7 +149,21 @@ def generate_motif(
 
             candidate = np.array(x, copy=True)
             candidate[start : end + 1] = donor_seg
-            candidate = apply_constraints(candidate, x, immutable_features, bounds)
+            if use_constraints_v2:
+                candidate, c_v, c_break = apply_constraints_v2(
+                    candidate,
+                    x,
+                    immutable_features=immutable_features,
+                    bounds=bounds,
+                    max_delta_per_step=max_delta_per_step,
+                    relational_linear=relational_linear,
+                )
+            else:
+                candidate = apply_constraints(candidate, x, immutable_features, bounds)
+                c_v, c_break = 0.0, None
+            if c_v < best_constraint_violation:
+                best_constraint_violation = float(c_v)
+                best_constraint_breakdown = c_break
             score_after = reconstruction_score(model, candidate)
 
             cand = compute_candidate_metrics(
@@ -164,6 +184,8 @@ def generate_motif(
                 "motif_rank_score": float(rank_score),
                 "affine_a": float(a),
                 "affine_b": float(b),
+                "constraint_violation": float(c_v),
+                "constraint_breakdown": c_break,
             }
             all_candidates.append(cand)
 
@@ -189,6 +211,8 @@ def generate_motif(
             "score_after": float(best.score_cf),
             "n_segments_considered": int(len(segment_candidates)),
             "n_candidates_evaluated": int(attempted),
+            "constraint_violation": float(best.diagnostics["constraint_violation"]),
+            "constraint_breakdown": best.diagnostics["constraint_breakdown"],
             "runtime_ms": runtime_ms,
         }
         meta.update(build_explainability_meta(x, best.x_cf))
@@ -204,6 +228,10 @@ def generate_motif(
             "motif_lengths_considered": sorted(int(v) for v in motif_lengths),
             "n_segments_considered": int(len(segment_candidates)),
             "n_candidates_evaluated": int(attempted),
+            "best_constraint_violation": (
+                None if not np.isfinite(best_constraint_violation) else float(best_constraint_violation)
+            ),
+            "best_constraint_breakdown": best_constraint_breakdown,
             "runtime_ms": runtime_ms,
         },
     )

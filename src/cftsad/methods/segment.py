@@ -7,6 +7,7 @@ import numpy as np
 
 from cftsad.core.candidates import compute_candidate_metrics, rank_candidates
 from cftsad.core.constraints import apply_constraints
+from cftsad.core.constraints_v2 import apply_constraints_v2
 from cftsad.core.postprocess import build_explainability_meta
 from cftsad.core.distances import window_mse_distance
 from cftsad.core.scoring import reconstruction_errors_per_timestep, reconstruction_score
@@ -145,6 +146,9 @@ def generate_segment(
     top_k_donors: int = 8,
     context_width: int = 2,
     crossfade_width: int = 3,
+    use_constraints_v2: bool = False,
+    max_delta_per_step: float | None = None,
+    relational_linear: Dict[str, tuple[int, int, float]] | None = None,
 ) -> CFResult | CFFailure:
     t0 = time.perf_counter()
     score_before = reconstruction_score(model, x)
@@ -160,6 +164,8 @@ def generate_segment(
 
     candidates = []
     attempted = 0
+    best_constraint_violation = np.inf
+    best_constraint_breakdown = None
 
     for start, end in segments:
         c0 = max(0, start - int(context_width))
@@ -185,7 +191,21 @@ def generate_segment(
                     end=end,
                     width=int(crossfade_width),
                 )
-            x_cf = apply_constraints(x_cf, x, immutable_features, bounds)
+            if use_constraints_v2:
+                x_cf, c_v, c_break = apply_constraints_v2(
+                    x_cf,
+                    x,
+                    immutable_features=immutable_features,
+                    bounds=bounds,
+                    max_delta_per_step=max_delta_per_step,
+                    relational_linear=relational_linear,
+                )
+            else:
+                x_cf = apply_constraints(x_cf, x, immutable_features, bounds)
+                c_v, c_break = 0.0, None
+            if c_v < best_constraint_violation:
+                best_constraint_violation = float(c_v)
+                best_constraint_breakdown = c_break
             score_after = reconstruction_score(model, x_cf)
             cand = compute_candidate_metrics(
                 x=x,
@@ -200,6 +220,8 @@ def generate_segment(
                 "context_end": int(c1),
                 "donor_idx": int(donor_idx),
                 "segment_distance": float(donor_dists[int(donor_idx)]),
+                "constraint_violation": float(c_v),
+                "constraint_breakdown": c_break,
             }
             candidates.append(cand)
 
@@ -219,6 +241,8 @@ def generate_segment(
             "smoothing_used": bool(smoothing),
             "n_segments_considered": int(len(segments)),
             "n_candidates_evaluated": int(attempted),
+            "constraint_violation": float(best.diagnostics["constraint_violation"]),
+            "constraint_breakdown": best.diagnostics["constraint_breakdown"],
             "runtime_ms": runtime_ms,
         }
         meta.update(build_explainability_meta(x, best.x_cf))
@@ -234,6 +258,10 @@ def generate_segment(
             "smoothing_used": bool(smoothing),
             "n_segments_considered": int(len(segments)),
             "n_candidates_evaluated": int(attempted),
+            "best_constraint_violation": (
+                None if not np.isfinite(best_constraint_violation) else float(best_constraint_violation)
+            ),
+            "best_constraint_breakdown": best_constraint_breakdown,
             "runtime_ms": runtime_ms,
         },
     )

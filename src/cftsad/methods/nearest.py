@@ -7,6 +7,7 @@ import numpy as np
 
 from cftsad.core.candidates import compute_candidate_metrics, rank_candidates
 from cftsad.core.constraints import apply_constraints
+from cftsad.core.constraints_v2 import apply_constraints_v2
 from cftsad.core.postprocess import build_explainability_meta
 from cftsad.core.distances import window_mse_distance
 from cftsad.core.scoring import reconstruction_score
@@ -37,6 +38,9 @@ def generate_nearest(
     alpha_steps: int = 11,
     donor_filter_factor: float = 1.0,
     use_weighted_distance: bool = True,
+    use_constraints_v2: bool = False,
+    max_delta_per_step: float | None = None,
+    relational_linear: Dict[str, tuple[int, int, float]] | None = None,
 ) -> CFResult | CFFailure:
     t0 = time.perf_counter()
     score_before = reconstruction_score(model, x)
@@ -78,6 +82,8 @@ def generate_nearest(
     alphas = np.linspace(0.0, 1.0, a_steps)
     candidates = []
     attempts = 0
+    best_constraint_violation = np.inf
+    best_constraint_breakdown = None
 
     for donor_idx in shortlist_idx:
         donor = normal_core[int(donor_idx)]
@@ -89,7 +95,21 @@ def generate_nearest(
         for alpha in alphas:
             attempts += 1
             mixed = (1.0 - float(alpha)) * x + float(alpha) * donor
-            x_cf = apply_constraints(mixed, x, immutable_features, bounds)
+            if use_constraints_v2:
+                x_cf, c_v, c_break = apply_constraints_v2(
+                    mixed,
+                    x,
+                    immutable_features=immutable_features,
+                    bounds=bounds,
+                    max_delta_per_step=max_delta_per_step,
+                    relational_linear=relational_linear,
+                )
+            else:
+                x_cf = apply_constraints(mixed, x, immutable_features, bounds)
+                c_v, c_break = 0.0, None
+            if c_v < best_constraint_violation:
+                best_constraint_violation = float(c_v)
+                best_constraint_breakdown = c_break
             score_after = reconstruction_score(model, x_cf)
             cand = compute_candidate_metrics(
                 x=x,
@@ -101,6 +121,8 @@ def generate_nearest(
                 "donor_idx": int(donor_idx),
                 "alpha": float(alpha),
                 "donor_distance": donor_distance,
+                "constraint_violation": float(c_v),
+                "constraint_breakdown": c_break,
             }
             candidates.append(cand)
 
@@ -117,6 +139,8 @@ def generate_nearest(
             "strict_donor_threshold": strict_thr,
             "shortlist_size": int(k),
             "n_attempts": int(attempts),
+            "constraint_violation": float(best.diagnostics["constraint_violation"]),
+            "constraint_breakdown": best.diagnostics["constraint_breakdown"],
             "runtime_ms": runtime_ms,
         }
         meta.update(build_explainability_meta(x, best.x_cf))
@@ -132,6 +156,10 @@ def generate_nearest(
             "strict_donor_threshold": strict_thr,
             "shortlist_size": int(k),
             "n_attempts": int(attempts),
+            "best_constraint_violation": (
+                None if not np.isfinite(best_constraint_violation) else float(best_constraint_violation)
+            ),
+            "best_constraint_breakdown": best_constraint_breakdown,
             "runtime_ms": runtime_ms,
         },
     )
