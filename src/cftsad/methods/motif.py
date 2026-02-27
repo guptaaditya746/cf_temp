@@ -5,9 +5,11 @@ from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 
+from cftsad.core.candidates import compute_candidate_metrics, rank_candidates
 from cftsad.core.constraints import apply_constraints
+from cftsad.core.postprocess import build_explainability_meta
 from cftsad.core.scoring import reconstruction_score
-from cftsad.methods.segment import detect_anomalous_segment
+from cftsad.methods.segment import detect_candidate_segments
 from cftsad.types import CFFailure, CFResult
 
 
@@ -38,6 +40,34 @@ def _build_motif_index(normal_core: np.ndarray, motif_length: int) -> tuple[np.n
     return np.asarray(vectors, dtype=np.float64), sources
 
 
+def _fit_affine(target: np.ndarray, motif: np.ndarray, eps: float = 1e-8) -> tuple[float, float]:
+    x = motif.reshape(-1).astype(np.float64)
+    y = target.reshape(-1).astype(np.float64)
+    x_mean = float(np.mean(x))
+    y_mean = float(np.mean(y))
+    var_x = float(np.mean((x - x_mean) ** 2))
+    if var_x < eps:
+        return 1.0, float(y_mean - x_mean)
+    cov = float(np.mean((x - x_mean) * (y - y_mean)))
+    a = cov / (var_x + eps)
+    b = y_mean - a * x_mean
+    return float(a), float(b)
+
+
+def _boundary_penalty(
+    x: np.ndarray,
+    candidate_seg: np.ndarray,
+    start: int,
+    end: int,
+) -> float:
+    penalty = 0.0
+    if start > 0:
+        penalty += float(np.mean((x[start - 1] - candidate_seg[0]) ** 2))
+    if end < x.shape[0] - 1:
+        penalty += float(np.mean((candidate_seg[-1] - x[end + 1]) ** 2))
+    return penalty
+
+
 def generate_motif(
     model: object,
     x: np.ndarray,
@@ -46,85 +76,134 @@ def generate_motif(
     immutable_features: Optional[Iterable[int]] = None,
     bounds: Optional[Dict[int, Tuple[float, float]]] = None,
     top_k: int = 5,
+    n_segments: int = 4,
+    length_factors: tuple[float, ...] = (0.75, 1.0, 1.25),
+    context_weight: float = 0.2,
+    use_affine_fit: bool = True,
 ) -> CFResult | CFFailure:
     t0 = time.perf_counter()
     score_before = reconstruction_score(model, x)
+    thr = float(threshold)
 
-    segment = detect_anomalous_segment(model, x)
-    if segment is None:
+    base_segments = detect_candidate_segments(model, x, n_segments=n_segments)
+    if not base_segments:
         return CFFailure(
             reason="segment_detection_failed",
             message="Unable to detect anomalous segment for motif substitution.",
-            diagnostics={"score_before": score_before, "threshold": float(threshold)},
+            diagnostics={"score_before": score_before, "threshold": thr},
         )
 
-    start, end = segment
-    motif_length = end - start + 1
+    segment_candidates: list[tuple[int, int]] = []
+    for start, end in base_segments:
+        base_len = end - start + 1
+        center = (start + end) // 2
+        for fac in length_factors:
+            mlen = max(3, int(round(base_len * float(fac))))
+            half = mlen // 2
+            s = max(0, center - half)
+            e = min(x.shape[0] - 1, s + mlen - 1)
+            s = max(0, e - mlen + 1)
+            segment_candidates.append((int(s), int(e)))
+    segment_candidates = sorted(set(segment_candidates))
 
-    motif_vectors, sources = _build_motif_index(normal_core, motif_length)
-    if motif_vectors.shape[0] == 0:
-        return CFFailure(
-            reason="no_valid_cf",
-            message="No motifs available for detected segment length.",
-            diagnostics={"motif_length": motif_length, "score_before": score_before},
-        )
+    all_candidates = []
+    attempted = 0
+    motif_lengths = set()
 
-    query = _z_normalize(x[start : end + 1]).reshape(-1).astype(np.float64)
-    dists = np.linalg.norm(motif_vectors - query[None, :], axis=1)
+    for start, end in segment_candidates:
+        motif_length = end - start + 1
+        motif_lengths.add(int(motif_length))
+        motif_vectors, sources = _build_motif_index(normal_core, motif_length)
+        if motif_vectors.shape[0] == 0:
+            continue
 
-    k = max(1, min(int(top_k), dists.shape[0]))
-    top_idx = np.argpartition(dists, k - 1)[:k]
-    top_idx = top_idx[np.argsort(dists[top_idx])]
-    topk_distances = [float(dists[i]) for i in top_idx]
+        query = _z_normalize(x[start : end + 1]).reshape(-1).astype(np.float64)
+        shape_dist = np.linalg.norm(motif_vectors - query[None, :], axis=1)
+        k = max(1, min(int(top_k), shape_dist.shape[0]))
+        top_idx = np.argpartition(shape_dist, k - 1)[:k]
+        top_idx = top_idx[np.argsort(shape_dist[top_idx])]
 
-    best_result: CFResult | None = None
-    best_score = np.inf
-    best_source: tuple[int, int] | None = None
+        for idx in top_idx:
+            attempted += 1
+            donor_idx, donor_start = sources[int(idx)]
+            donor_end = donor_start + motif_length
 
-    for idx in top_idx:
-        donor_idx, donor_start = sources[int(idx)]
-        donor_end = donor_start + motif_length
+            donor_seg = np.array(
+                normal_core[int(donor_idx), donor_start:donor_end],
+                copy=True,
+            )
+            if use_affine_fit:
+                a, b = _fit_affine(x[start : end + 1], donor_seg)
+                donor_seg = a * donor_seg + b
+            else:
+                a, b = 1.0, 0.0
 
-        candidate = np.array(x, copy=True)
-        candidate[start : end + 1] = normal_core[donor_idx, donor_start:donor_end]
-        candidate = apply_constraints(candidate, x, immutable_features, bounds)
+            boundary = _boundary_penalty(x, donor_seg, start, end)
+            rank_score = float(shape_dist[int(idx)]) + float(context_weight) * boundary
 
-        score_after = reconstruction_score(model, candidate)
-        if score_after <= threshold and score_after < best_score:
-            best_score = score_after
-            best_source = (donor_idx, donor_start)
-            best_result = CFResult(
+            candidate = np.array(x, copy=True)
+            candidate[start : end + 1] = donor_seg
+            candidate = apply_constraints(candidate, x, immutable_features, bounds)
+            score_after = reconstruction_score(model, candidate)
+
+            cand = compute_candidate_metrics(
+                x=x,
                 x_cf=candidate,
                 score_cf=score_after,
-                meta={
-                    "motif_length": motif_length,
-                    "topk_distances": topk_distances,
-                    "chosen_motif_source": {
-                        "donor_idx": donor_idx,
-                        "segment_start": donor_start,
-                        "segment_end": donor_end - 1,
-                    },
-                    "score_before": score_before,
-                    "score_after": score_after,
-                },
+                normal_core=normal_core,
             )
+            cand.diagnostics = {
+                "motif_length": int(motif_length),
+                "segment_start": int(start),
+                "segment_end": int(end),
+                "donor_idx": int(donor_idx),
+                "donor_segment_start": int(donor_start),
+                "donor_segment_end": int(donor_end - 1),
+                "shape_distance": float(shape_dist[int(idx)]),
+                "boundary_penalty": float(boundary),
+                "motif_rank_score": float(rank_score),
+                "affine_a": float(a),
+                "affine_b": float(b),
+            }
+            all_candidates.append(cand)
 
+    ranked = rank_candidates(all_candidates, threshold=thr)
     runtime_ms = (time.perf_counter() - t0) * 1000.0
-    if best_result is not None:
-        best_result.meta["runtime_ms"] = runtime_ms
-        return best_result
+    if ranked and ranked[0].score_cf <= thr:
+        best = ranked[0]
+        meta = {
+            "motif_length": int(best.diagnostics["motif_length"]),
+            "segment_start": int(best.diagnostics["segment_start"]),
+            "segment_end": int(best.diagnostics["segment_end"]),
+            "chosen_motif_source": {
+                "donor_idx": int(best.diagnostics["donor_idx"]),
+                "segment_start": int(best.diagnostics["donor_segment_start"]),
+                "segment_end": int(best.diagnostics["donor_segment_end"]),
+            },
+            "shape_distance": float(best.diagnostics["shape_distance"]),
+            "boundary_penalty": float(best.diagnostics["boundary_penalty"]),
+            "motif_rank_score": float(best.diagnostics["motif_rank_score"]),
+            "affine_a": float(best.diagnostics["affine_a"]),
+            "affine_b": float(best.diagnostics["affine_b"]),
+            "score_before": score_before,
+            "score_after": float(best.score_cf),
+            "n_segments_considered": int(len(segment_candidates)),
+            "n_candidates_evaluated": int(attempted),
+            "runtime_ms": runtime_ms,
+        }
+        meta.update(build_explainability_meta(x, best.x_cf))
+        return CFResult(x_cf=best.x_cf, score_cf=float(best.score_cf), meta=meta)
 
     return CFFailure(
         reason="no_valid_cf",
-        message="Top-k motifs did not produce a valid counterfactual.",
+        message="Motif search did not produce a valid counterfactual.",
         diagnostics={
-            "segment_start": start,
-            "segment_end": end,
-            "motif_length": motif_length,
-            "topk_distances": topk_distances,
-            "chosen_motif_source": best_source,
             "score_before": score_before,
-            "threshold": float(threshold),
+            "best_score_after": float(ranked[0].score_cf) if ranked else None,
+            "threshold": thr,
+            "motif_lengths_considered": sorted(int(v) for v in motif_lengths),
+            "n_segments_considered": int(len(segment_candidates)),
+            "n_candidates_evaluated": int(attempted),
             "runtime_ms": runtime_ms,
         },
     )

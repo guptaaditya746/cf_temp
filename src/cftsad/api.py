@@ -45,7 +45,27 @@ class CounterfactualExplainer:
 
         # Method-specific knobs
         self.motif_top_k = int(method_kwargs.pop("motif_top_k", 5))
+        self.motif_n_segments = int(method_kwargs.pop("motif_n_segments", 4))
+        self.motif_length_factors = tuple(
+            float(v) for v in method_kwargs.pop("motif_length_factors", (0.75, 1.0, 1.25))
+        )
+        self.motif_context_weight = float(method_kwargs.pop("motif_context_weight", 0.2))
+        self.motif_use_affine_fit = bool(method_kwargs.pop("motif_use_affine_fit", True))
+
         self.segment_smoothing = bool(method_kwargs.pop("segment_smoothing", False))
+        self.segment_n_candidates = int(method_kwargs.pop("segment_n_candidates", 4))
+        self.segment_top_k_donors = int(method_kwargs.pop("segment_top_k_donors", 8))
+        self.segment_context_width = int(method_kwargs.pop("segment_context_width", 2))
+        self.segment_crossfade_width = int(method_kwargs.pop("segment_crossfade_width", 3))
+
+        self.nearest_top_k = int(method_kwargs.pop("nearest_top_k", 10))
+        self.nearest_alpha_steps = int(method_kwargs.pop("nearest_alpha_steps", 11))
+        self.nearest_donor_filter_factor = float(
+            method_kwargs.pop("nearest_donor_filter_factor", 1.0)
+        )
+        self.nearest_use_weighted_distance = bool(
+            method_kwargs.pop("nearest_use_weighted_distance", True)
+        )
 
         self.population_size = int(method_kwargs.pop("population_size", 100))
         self.n_generations = int(method_kwargs.pop("n_generations", 50))
@@ -158,6 +178,39 @@ class CounterfactualExplainer:
         if not (self.mutation_sigma > 0.0):
             return "mutation_sigma must be > 0"
 
+        if self.nearest_top_k < 1:
+            return "nearest_top_k must be >= 1"
+        if self.nearest_alpha_steps < 2:
+            return "nearest_alpha_steps must be >= 2"
+        if (
+            not np.isfinite(self.nearest_donor_filter_factor)
+            or self.nearest_donor_filter_factor <= 0.0
+        ):
+            return "nearest_donor_filter_factor must be finite and > 0"
+
+        if self.segment_n_candidates < 1:
+            return "segment_n_candidates must be >= 1"
+        if self.segment_top_k_donors < 1:
+            return "segment_top_k_donors must be >= 1"
+        if self.segment_context_width < 0:
+            return "segment_context_width must be >= 0"
+        if self.segment_crossfade_width < 1:
+            return "segment_crossfade_width must be >= 1"
+
+        if self.motif_n_segments < 1:
+            return "motif_n_segments must be >= 1"
+        if self.motif_top_k < 1:
+            return "motif_top_k must be >= 1"
+        if not self.motif_length_factors:
+            return "motif_length_factors must be non-empty"
+        if any(v <= 0.0 or not np.isfinite(v) for v in self.motif_length_factors):
+            return "motif_length_factors values must be finite and > 0"
+        if (
+            not np.isfinite(self.motif_context_weight)
+            or self.motif_context_weight < 0.0
+        ):
+            return "motif_context_weight must be finite and >= 0"
+
         if self.method_kwargs:
             bad = ", ".join(sorted(self.method_kwargs.keys()))
             return f"unknown method kwargs: {bad}"
@@ -201,6 +254,10 @@ class CounterfactualExplainer:
                     threshold=float(self.threshold),
                     immutable_features=self.immutable_features,
                     bounds=self.bounds,
+                    top_k=self.nearest_top_k,
+                    alpha_steps=self.nearest_alpha_steps,
+                    donor_filter_factor=self.nearest_donor_filter_factor,
+                    use_weighted_distance=self.nearest_use_weighted_distance,
                 )
 
             if self.method == "segment":
@@ -212,6 +269,10 @@ class CounterfactualExplainer:
                     immutable_features=self.immutable_features,
                     bounds=self.bounds,
                     smoothing=self.segment_smoothing,
+                    n_segments=self.segment_n_candidates,
+                    top_k_donors=self.segment_top_k_donors,
+                    context_width=self.segment_context_width,
+                    crossfade_width=self.segment_crossfade_width,
                 )
 
             if self.method == "motif":
@@ -223,6 +284,10 @@ class CounterfactualExplainer:
                     immutable_features=self.immutable_features,
                     bounds=self.bounds,
                     top_k=self.motif_top_k,
+                    n_segments=self.motif_n_segments,
+                    length_factors=self.motif_length_factors,
+                    context_weight=self.motif_context_weight,
+                    use_affine_fit=self.motif_use_affine_fit,
                 )
 
             if self.method == "genetic":
