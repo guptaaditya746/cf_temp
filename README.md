@@ -4,6 +4,14 @@ Counterfactual explanations for reconstruction-based time-series anomaly detecti
 
 ## Installation
 
+Install from PyPI (after first release):
+
+```bash
+pip install cftsad
+```
+
+Install directly from source:
+
 ```bash
 pip install .
 ```
@@ -12,6 +20,12 @@ Editable install (for development):
 
 ```bash
 pip install -e .
+```
+
+Install from GitHub:
+
+```bash
+pip install "git+https://github.com/<org-or-user>/cftsad.git"
 ```
 
 ## Minimal example
@@ -128,4 +142,52 @@ explainer = CounterfactualExplainer(
     mutation_sigma=0.05,
     use_smoothness_objective=False,
 )
+```
+
+## Return values
+
+`explain(x)` returns either:
+- `CFResult` on success
+- `CFFailure` on failure
+
+### `CFResult`
+
+Fields:
+- `x_cf: np.ndarray`  
+  Counterfactual window with shape `(L, F)`.
+- `score_cf: float`  
+  Reconstruction score of `x_cf` (lower is better).
+- `meta: dict`  
+  Method-specific diagnostics (for example `donor_idx`, `segment_start`, `runtime_ms`, `warning`).
+
+### `CFFailure`
+
+Fields:
+- `reason: str`  
+  Machine-readable failure code.
+- `message: str`  
+  Human-readable summary of what failed.
+- `diagnostics: dict`  
+  Extra debugging information (threshold, scores, indices, exception type, etc.).
+
+Common `reason` values include:
+- `invalid_input`
+- `segment_detection_failed`
+- `no_valid_cf`
+- `optimization_failed`
+
+### Example: handling return type
+
+```python
+from cftsad import CounterfactualExplainer, CFResult, CFFailure
+
+result = explainer.explain(x)
+
+if isinstance(result, CFResult):
+    print("success:", result.score_cf, result.x_cf.shape)
+    print("meta keys:", result.meta.keys())
+elif isinstance(result, CFFailure):
+    print("failed:", result.reason)
+    print(result.message)
+    print("diagnostics:", result.diagnostics)
 ```

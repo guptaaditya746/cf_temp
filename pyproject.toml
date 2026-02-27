@@ -12,15 +12,41 @@ license = { text = "Proprietary" }
 authors = [
   { name = "cftsad contributors" }
 ]
+keywords = ["counterfactual", "anomaly-detection", "time-series", "explainability"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: Other/Proprietary License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "numpy>=1.23"
 ]
 
 [project.optional-dependencies]
 torch = ["torch>=2.0"]
+dev = [
+  "build>=1.2.2",
+  "pip-audit>=2.7.0",
+  "pytest>=8.0.0",
+  "ruff>=0.6.0",
+  "twine>=5.1.0",
+]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

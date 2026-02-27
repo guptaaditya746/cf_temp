@@ -4,7 +4,7 @@ from typing import Dict, Iterable, Literal, Optional, Tuple
 
 import numpy as np
 
-from cftsad.core.scoring import compute_threshold_from_normal_core
+from cftsad.core.normal_core import build_normal_core
 from cftsad.methods.genetic import generate_genetic
 from cftsad.methods.motif import generate_motif
 from cftsad.methods.nearest import generate_nearest
@@ -32,6 +32,16 @@ class CounterfactualExplainer:
         self.immutable_features = tuple(method_kwargs.pop("immutable_features", ()))
         self.bounds = dict(method_kwargs.pop("bounds", {}))
         self.random_seed = int(method_kwargs.pop("random_seed", 42))
+        self.normal_core_filter_factor = float(
+            method_kwargs.pop("normal_core_filter_factor", 1.0)
+        )
+        self.normal_core_threshold_quantile = float(
+            method_kwargs.pop("normal_core_threshold_quantile", 0.95)
+        )
+        self.normal_core_max_size = method_kwargs.pop("normal_core_max_size", None)
+        self.normal_core_use_diversity_sampling = bool(
+            method_kwargs.pop("normal_core_use_diversity_sampling", True)
+        )
 
         # Method-specific knobs
         self.motif_top_k = int(method_kwargs.pop("motif_top_k", 5))
@@ -54,12 +64,30 @@ class CounterfactualExplainer:
         if invalid_reason is not None:
             raise ValueError(invalid_reason)
 
+        core_build = build_normal_core(
+            model=self.model,
+            normal_core=self.normal_core,
+            threshold=self.threshold,
+            filter_factor=self.normal_core_filter_factor,
+            threshold_quantile=self.normal_core_threshold_quantile,
+            max_core_size=self.normal_core_max_size,
+            use_diversity_sampling=self.normal_core_use_diversity_sampling,
+            random_seed=self.random_seed,
+        )
+        self.normal_core = core_build.normal_core
+        self.core_index = core_build.selected_indices
+        self.core_embeddings = core_build.embeddings
+        self.core_scores = core_build.selected_scores
+        self.core_scores_all = core_build.all_scores
+        self.core_build_info = {
+            "base_threshold": float(core_build.base_threshold),
+            "strict_threshold": float(core_build.strict_threshold),
+            "core_size_before": int(self.core_scores_all.shape[0]),
+            "core_size_after": int(self.normal_core.shape[0]),
+        }
+
         if self.threshold is None:
-            self.threshold = compute_threshold_from_normal_core(
-                self.model,
-                self.normal_core,
-                quantile=0.95,
-            )
+            self.threshold = float(core_build.base_threshold)
         else:
             self.threshold = float(self.threshold)
 
@@ -83,6 +111,24 @@ class CounterfactualExplainer:
                 return "threshold must be a numeric scalar"
             if not np.isfinite(thr) or thr < 0.0:
                 return "threshold must be finite and non-negative"
+
+        if (
+            not np.isfinite(self.normal_core_filter_factor)
+            or self.normal_core_filter_factor <= 0.0
+        ):
+            return "normal_core_filter_factor must be finite and > 0"
+
+        if not (0.0 < self.normal_core_threshold_quantile < 1.0):
+            return "normal_core_threshold_quantile must be in (0, 1)"
+
+        if self.normal_core_max_size is not None:
+            try:
+                max_size = int(self.normal_core_max_size)
+            except Exception:
+                return "normal_core_max_size must be an integer when provided"
+            if max_size < 1:
+                return "normal_core_max_size must be >= 1 when provided"
+            self.normal_core_max_size = max_size
 
         _, _, n_features = self.normal_core.shape
 
