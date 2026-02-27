@@ -609,181 +609,194 @@ anomaly_indices = np.where(test_window_anomalies == 1)[0]
 import torch
 import numpy as np
 
-def autoencoder_predict(x_np):
-    """
-    Bridge function for cftsad.
-    Input: numpy array of shape (L, F) or (1, L, F)
-    Output: reconstructed numpy array of the exact same shape.
-    """
-    # 1. Put model in evaluation mode
-    model.eval()
-    model_device = next(model.parameters()).device
-
-    with torch.no_grad():
-        # 2. Convert to tensor and move to the device the model is on
-        x_tensor = torch.tensor(x_np, dtype=torch.float32).to(model_device)
-
-        # 3. Handle batch dimension
-        # cftsad might pass (L, F). Our model expects (Batch, L, F)
-        added_batch_dim = False
-        if x_tensor.ndim == 2:
-            x_tensor = x_tensor.unsqueeze(0)
-            added_batch_dim = True
-
-        # 4. Forward pass
-        reconstruction = model(x_tensor)
-
-        # 5. Convert back to numpy
-        out_np = reconstruction.cpu().numpy()
-
-        # 6. Remove batch dimension if we added it, strictly matching input shape
-        if added_batch_dim:
-            out_np = out_np.squeeze(0)
-
-        return out_np
-
-
-import pandas as pd
-import os
-
 # Import cftsad API from installed package or local src fallback.
 try:
     from cftsad import CFFailure, CFResult, CounterfactualExplainer
 except Exception:
     from src.cftsad import CFFailure, CFResult, CounterfactualExplainer
 
-# 1. Setup logging directories inside your unified tracking folder
-csv_path = os.path.join(eval_dir, "counterfactual_log.csv")
-cf_arrays_dir = os.path.join(eval_dir, "cf_arrays")
-os.makedirs(cf_arrays_dir, exist_ok=True)
 
-# 2. Select anomaly index robustly
-if len(anomaly_indices) == 0:
-    raise RuntimeError("No anomalies found in test set for counterfactual generation.")
-idx_to_explain = int(anomaly_indices[0])
-x_anomaly = X_test[idx_to_explain]
+class AutoencoderPredictorAdapter:
+    """
+    Thin model adapter so cftsad can call the AE with a stable numpy API.
+    """
 
-print(f"Generating counterfactuals for Test Window Index: {idx_to_explain}")
-print(f"Original score: {test_window_mse[idx_to_explain]:.4f}")
-print(f"Target threshold: {window_threshold:.4f}")
+    def __init__(self, model):
+        self.model = model
 
-# 3. Build detailed explainers for all methods
-explainers = {
-    "nearest": CounterfactualExplainer(
-        method="nearest",
-        model=autoencoder_predict,
-        normal_core=X_train,
-        threshold=window_threshold,
-        nearest_top_k=10,
-        nearest_alpha_steps=11,
-        nearest_use_weighted_distance=True,
-        use_constraints_v2=True,
-        enable_fallback_chain=True,
-        fallback_methods=("segment", "motif", "genetic"),
-        fallback_retry_budget=2,
-    ),
-    "segment": CounterfactualExplainer(
-        method="segment",
-        model=autoencoder_predict,
-        normal_core=X_train,
-        threshold=window_threshold,
-        segment_smoothing=True,
-        segment_n_candidates=4,
-        segment_top_k_donors=8,
-        segment_context_width=2,
-        segment_crossfade_width=3,
-        use_constraints_v2=True,
-        enable_fallback_chain=True,
-        fallback_methods=("motif", "nearest", "genetic"),
-        fallback_retry_budget=2,
-    ),
-    "motif": CounterfactualExplainer(
-        method="motif",
-        model=autoencoder_predict,
-        normal_core=X_train,
-        threshold=window_threshold,
-        motif_top_k=10,
-        motif_n_segments=4,
-        motif_length_factors=(0.75, 1.0, 1.25),
-        motif_context_weight=0.2,
-        motif_use_affine_fit=True,
-        use_constraints_v2=True,
-        enable_fallback_chain=True,
-        fallback_methods=("segment", "nearest", "genetic"),
-        fallback_retry_budget=2,
-    ),
-    "genetic": CounterfactualExplainer(
-        method="genetic",
-        model=autoencoder_predict,
-        normal_core=X_train,
-        threshold=window_threshold,
-        population_size=100,
-        n_generations=50,
-        use_plausibility_objective=True,
-        structured_mutation_weight=0.35,
-        top_m_solutions=5,
-        early_stop_patience=15,
-        use_constraints_v2=True,
-        enable_fallback_chain=True,
-        fallback_methods=("segment", "motif", "nearest"),
-        fallback_retry_budget=2,
-    ),
-}
+    def __call__(self, x_np):
+        x_arr = np.asarray(x_np, dtype=np.float32)
+        self.model.eval()
+        model_device = next(self.model.parameters()).device
 
-print("Explainers initialized:", ", ".join(explainers.keys()))
+        with torch.no_grad():
+            x_tensor = torch.as_tensor(x_arr, dtype=torch.float32, device=model_device)
+            added_batch_dim = False
+            if x_tensor.ndim == 2:
+                x_tensor = x_tensor.unsqueeze(0)
+                added_batch_dim = True
+
+            reconstruction = self.model(x_tensor).detach().cpu().numpy()
+            if added_batch_dim:
+                reconstruction = reconstruction.squeeze(0)
+            return reconstruction
+
 
 def _safe_log_value(v):
     if isinstance(v, (str, int, float, bool, np.integer, np.floating)):
         return v
     return str(v)
 
-# 4. Run and log each method
-rows = []
-results_by_method = {}
-for method_name, explainer in explainers.items():
-    result = explainer.explain(x_anomaly)
-    results_by_method[method_name] = result
 
-    row = {
-        "method": method_name,
-        "test_index": idx_to_explain,
-        "original_score": float(test_window_mse[idx_to_explain]),
-        "target_threshold": float(window_threshold),
-        "status": "success" if isinstance(result, CFResult) else "failed",
+def build_cftsad_explainers(model_predict_fn, normal_core, threshold):
+    base_kwargs = {
+        "model": model_predict_fn,
+        "normal_core": normal_core,
+        "threshold": float(threshold),
+        "use_constraints_v2": True,
+        "enable_fallback_chain": True,
+        "fallback_retry_budget": 2,
+        "normal_core_threshold_quantile": 0.95,
+        "normal_core_filter_factor": 1.0,
+        "random_seed": 42,
     }
 
-    if isinstance(result, CFResult):
-        print(f"[{method_name}] success -> cf_score={result.score_cf:.4f}")
-        row["cf_score"] = float(result.score_cf)
-        row["reason"] = "N/A"
-        row["message"] = "N/A"
-        cf_filename = f"cf_{method_name}_window_{idx_to_explain}.npy"
-        np.save(os.path.join(cf_arrays_dir, cf_filename), result.x_cf)
-        row["cf_array_file"] = cf_filename
-        for k, v in result.meta.items():
-            row[f"meta_{k}"] = _safe_log_value(v)
+    method_overrides = {
+        "nearest": {
+            "nearest_top_k": 10,
+            "nearest_alpha_steps": 11,
+            "nearest_use_weighted_distance": True,
+            "fallback_methods": ("segment", "motif", "genetic"),
+        },
+        "segment": {
+            "segment_smoothing": True,
+            "segment_n_candidates": 4,
+            "segment_top_k_donors": 8,
+            "segment_context_width": 2,
+            "segment_crossfade_width": 3,
+            "fallback_methods": ("motif", "nearest", "genetic"),
+        },
+        "motif": {
+            "motif_top_k": 10,
+            "motif_n_segments": 4,
+            "motif_length_factors": (0.75, 1.0, 1.25),
+            "motif_context_weight": 0.2,
+            "motif_use_affine_fit": True,
+            "fallback_methods": ("segment", "nearest", "genetic"),
+        },
+        "genetic": {
+            "population_size": 100,
+            "n_generations": 50,
+            "use_plausibility_objective": True,
+            "structured_mutation_weight": 0.35,
+            "top_m_solutions": 5,
+            "early_stop_patience": 15,
+            "fallback_methods": ("segment", "motif", "nearest"),
+        },
+    }
+
+    explainers = {}
+    for method, overrides in method_overrides.items():
+        explainers[method] = CounterfactualExplainer(
+            method=method,
+            **base_kwargs,
+            **overrides,
+        )
+    return explainers
+
+
+def run_counterfactual_benchmark(
+    explainers,
+    x_anomaly,
+    idx_to_explain,
+    original_score,
+    threshold,
+    eval_dir,
+):
+    csv_path = os.path.join(eval_dir, "counterfactual_log.csv")
+    cf_arrays_dir = os.path.join(eval_dir, "cf_arrays")
+    os.makedirs(cf_arrays_dir, exist_ok=True)
+
+    rows = []
+    results_by_method = {}
+    for method_name, explainer in explainers.items():
+        result = explainer.explain(x_anomaly)
+        results_by_method[method_name] = result
+
+        row = {
+            "method": method_name,
+            "test_index": int(idx_to_explain),
+            "original_score": float(original_score),
+            "target_threshold": float(threshold),
+            "status": "success" if isinstance(result, CFResult) else "failed",
+        }
+
+        if isinstance(result, CFResult):
+            print(f"[{method_name}] success -> cf_score={result.score_cf:.4f}")
+            row["cf_score"] = float(result.score_cf)
+            row["reason"] = "N/A"
+            row["message"] = "N/A"
+            cf_filename = f"cf_{method_name}_window_{idx_to_explain}.npy"
+            np.save(os.path.join(cf_arrays_dir, cf_filename), result.x_cf)
+            row["cf_array_file"] = cf_filename
+            for k, v in result.meta.items():
+                row[f"meta_{k}"] = _safe_log_value(v)
+        else:
+            print(f"[{method_name}] failed -> {result.reason}")
+            row["cf_score"] = np.nan
+            row["reason"] = result.reason
+            row["message"] = result.message
+            row["cf_array_file"] = "N/A"
+            for k, v in result.diagnostics.items():
+                row[f"diag_{k}"] = _safe_log_value(v)
+
+        rows.append(row)
+
+    df_log = pd.DataFrame(rows)
+    if not os.path.exists(csv_path):
+        df_log.to_csv(csv_path, index=False)
     else:
-        print(f"[{method_name}] failed -> {result.reason}")
-        row["cf_score"] = np.nan
-        row["reason"] = result.reason
-        row["message"] = result.message
-        row["cf_array_file"] = "N/A"
-        for k, v in result.diagnostics.items():
-            row[f"diag_{k}"] = _safe_log_value(v)
+        df_log.to_csv(csv_path, mode='a', header=False, index=False)
 
-    rows.append(row)
+    print(f"Counterfactual results appended to: {csv_path}")
+    return results_by_method
 
-# 5. Append all rows to CSV
-df_log = pd.DataFrame(rows)
-if not os.path.exists(csv_path):
-    df_log.to_csv(csv_path, index=False)
-else:
-    df_log.to_csv(csv_path, mode='a', header=False, index=False)
 
-print(f"Counterfactual results appended to: {csv_path}")
+if len(anomaly_indices) == 0:
+    raise RuntimeError("No anomalies found in test set for counterfactual generation.")
+
+predict_fn = AutoencoderPredictorAdapter(model)
+explainers = build_cftsad_explainers(
+    model_predict_fn=predict_fn,
+    normal_core=X_train,
+    threshold=window_threshold,
+)
+
+print(f"Found {len(anomaly_indices)} anomaly windows in test set.")
+print(f"Target threshold: {window_threshold:.4f}")
+print("Explainers initialized:", ", ".join(explainers.keys()))
+
+results_by_index = {}
+for idx in anomaly_indices:
+    idx_to_explain = int(idx)
+    x_anomaly = X_test[idx_to_explain]
+    original_score = float(test_window_mse[idx_to_explain])
+
+    print(f"\nGenerating counterfactuals for Test Window Index: {idx_to_explain}")
+    print(f"Original score: {original_score:.4f}")
+
+    results_by_method = run_counterfactual_benchmark(
+        explainers=explainers,
+        x_anomaly=x_anomaly,
+        idx_to_explain=idx_to_explain,
+        original_score=original_score,
+        threshold=window_threshold,
+        eval_dir=eval_dir,
+    )
+    results_by_index[idx_to_explain] = results_by_method
 
 
 # In[ ]:
 
 
-results_by_method
+results_by_index
