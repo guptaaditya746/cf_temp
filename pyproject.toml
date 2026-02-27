@@ -38,6 +38,11 @@ dev = [
   "twine>=5.1.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/guptaaditya746/cf_temp"
+Repository = "https://github.com/guptaaditya746/cf_temp"
+Issues = "https://github.com/guptaaditya746/cf_temp/issues"
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
