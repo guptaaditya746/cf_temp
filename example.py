@@ -87,8 +87,8 @@ import numpy as np
 import os
 
 # --- 1. Ingest ---
-data_path = '../cf/artifacts/Atacama.pkl'
-var_list_path = '../cf/artifacts/var_list.csv'
+data_path = './artifacts/ /Atacama.pkl'
+var_list_path = './artifacts/var_list.csv'
 
 # Load expected features
 with open(var_list_path, 'r') as f:
