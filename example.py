@@ -43,8 +43,8 @@ device = torch.device("mps" if torch.backends.mps.is_available()
 print(f"Currently using: {device}")
 
 # Ensure plots show up inside the notebook
-get_ipython().run_line_magic('matplotlib', 'inline')
-get_ipython().run_line_magic('config', "InlineBackend.figure_format = 'retina' # High-res plots")
+#get_ipython().run_line_magic('matplotlib', 'inline')
+#get_ipython().run_line_magic('config', "InlineBackend.figure_format = 'retina' # High-res plots")
 
 # Ignore annoying warnings (e.g., DeprecationWarnings)
 import warnings
@@ -107,7 +107,7 @@ df = df.sort_index()
 df = df[~df.index.duplicated(keep='first')]
 
 # Enforce consistent hourly sampling frequency
-df = df.asfreq('H')
+df = df.asfreq('h')
 
 # Resolve missing values (Forward fill short gaps to prevent leakage, median for the rest)
 df[FEATURES] = df[FEATURES].ffill(limit=3)
@@ -654,17 +654,19 @@ def build_cftsad_explainers(model_predict_fn, normal_core, threshold):
         "normal_core": normal_core,
         "threshold": float(threshold),
         "use_constraints_v2": True,
-        "enable_fallback_chain": True,
+        "enable_fallback_chain": False,
         "fallback_retry_budget": 2,
         "normal_core_threshold_quantile": 0.95,
         "normal_core_filter_factor": 1.0,
         "random_seed": 42,
+	"normal_core_max_size":100,
+	"normal_core_use_diversity_sampling": True,
     }
 
     method_overrides = {
         "nearest": {
             "nearest_top_k": 10,
-            "nearest_alpha_steps": 11,
+            "nearest_alpha_steps": 5,
             "nearest_use_weighted_distance": True,
             "fallback_methods": ("segment", "motif", "genetic"),
         },
@@ -677,16 +679,16 @@ def build_cftsad_explainers(model_predict_fn, normal_core, threshold):
             "fallback_methods": ("motif", "nearest", "genetic"),
         },
         "motif": {
-            "motif_top_k": 10,
-            "motif_n_segments": 4,
+            "motif_top_k": 5,
+            "motif_n_segments": 2,
             "motif_length_factors": (0.75, 1.0, 1.25),
             "motif_context_weight": 0.2,
             "motif_use_affine_fit": True,
             "fallback_methods": ("segment", "nearest", "genetic"),
         },
         "genetic": {
-            "population_size": 100,
-            "n_generations": 50,
+            "population_size": 50,
+            "n_generations": 20,
             "use_plausibility_objective": True,
             "structured_mutation_weight": 0.35,
             "top_m_solutions": 5,
@@ -768,7 +770,7 @@ if len(anomaly_indices) == 0:
 predict_fn = AutoencoderPredictorAdapter(model)
 explainers = build_cftsad_explainers(
     model_predict_fn=predict_fn,
-    normal_core=X_train,
+    normal_core=X_calib,
     threshold=window_threshold,
 )
 
