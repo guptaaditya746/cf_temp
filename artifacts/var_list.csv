@@ -1,0 +1,6 @@
+temperature_2m (°C)
+relative_humidity_2m (%)
+precipitation (mm)
+pressure_msl (hPa)
+cloud_cover (%)
+wind_speed_10m (km/h)
