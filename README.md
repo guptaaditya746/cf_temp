@@ -20,6 +20,18 @@ Editable dev install:
 pip install -e .
 ```
 
+Install with HTTP service extras:
+
+```bash
+pip install "cftsad[service]"
+```
+
+Install with dashboard extras:
+
+```bash
+pip install "cftsad[dashboard]"
+```
+
 ## Quick Start
 
 ```python
@@ -45,6 +57,67 @@ if isinstance(result, CFResult):
 else:
     print(result.reason, result.message)
 ```
+
+## API Service
+
+Run the API service:
+
+```bash
+cftsad-api
+```
+
+Or:
+
+```bash
+uvicorn cftsad.service:app --host 0.0.0.0 --port 8000
+```
+
+Endpoints:
+- `GET /health`
+- `POST /v1/explain`
+
+Example request:
+
+```bash
+curl -X POST "http://localhost:8000/v1/explain" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "method": "nearest",
+    "model": { "type": "moving_average", "kernel_size": 5 },
+    "normal_core": [[[0.0], [0.1], [0.0]], [[0.02], [0.09], [0.01]]],
+    "x": [[0.0], [2.0], [0.0]],
+    "threshold": null,
+    "method_kwargs": { "nearest_top_k": 2, "nearest_alpha_steps": 5 }
+  }'
+```
+
+Model options for `model`:
+- `{ "type": "identity" }`
+- `{ "type": "moving_average", "kernel_size": 5 }`
+- `{ "type": "python_callable", "import_path": "your_module:your_callable" }`
+
+## Demo Dashboard (Dash)
+
+Run the presentation dashboard:
+
+```bash
+cftsad-dashboard
+```
+
+Open `http://localhost:8050`.
+
+What it shows:
+- KPI cards for method, score shift, and dominant feature impact
+- Quality metrics from `utils/metrics.py`: `MarginToThr`, `TrimmedRMSE_scaled`, `TVL1D1`, `MahalMean_edited`
+- Anomalous vs counterfactual time-series comparison
+- Per-feature change magnitude bars
+- Data source modes: Example Artifacts, Mock Demo, Live API (`/v1/explain`)
+
+To use outputs from `example.py`:
+- Keep `results-root` as `results` (or set your custom parent folder)
+- Select a method and test index from `counterfactual_log.csv`
+- Click `Run Demo` to load `X_test.npy` + `evaluation/cf_arrays/*.npy`
+- `TrimmedRMSE_scaled` may show `N/A` if no scaler inputs are available
 
 ## Model API Contract
 
