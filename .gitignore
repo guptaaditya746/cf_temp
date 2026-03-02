@@ -16,7 +16,9 @@ ipython_config.py
 git/
 # Remove previous ipynb_checkpoints
 #   git rm -r .ipynb_checkpoints/
-
+results/
+git-lfs-3.5.1/
+git-lfs-3.4.1/
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/
