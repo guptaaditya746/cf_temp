@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 
@@ -12,6 +12,16 @@ from cftsad.core.postprocess import build_explainability_meta
 from cftsad.core.distances import window_mse_distance
 from cftsad.core.scoring import reconstruction_errors_per_timestep, reconstruction_score
 from cftsad.types import CFFailure, CFResult
+
+
+def _score_candidate(
+    model: object,
+    x_cf: np.ndarray,
+    score_fn: Optional[Callable[[np.ndarray], float]],
+) -> float:
+    if score_fn is not None:
+        return float(score_fn(np.asarray(x_cf, dtype=np.float64)))
+    return reconstruction_score(model, x_cf)
 
 
 def _largest_contiguous_region(indices: np.ndarray) -> tuple[int, int] | None:
@@ -149,9 +159,10 @@ def generate_segment(
     use_constraints_v2: bool = False,
     max_delta_per_step: float | None = None,
     relational_linear: Dict[str, tuple[int, int, float]] | None = None,
+    score_fn: Optional[Callable[[np.ndarray], float]] = None,
 ) -> CFResult | CFFailure:
     t0 = time.perf_counter()
-    score_before = reconstruction_score(model, x)
+    score_before = _score_candidate(model, x, score_fn)
     thr = float(threshold)
 
     segments = detect_candidate_segments(model, x, n_segments=n_segments)
@@ -206,7 +217,7 @@ def generate_segment(
             if c_v < best_constraint_violation:
                 best_constraint_violation = float(c_v)
                 best_constraint_breakdown = c_break
-            score_after = reconstruction_score(model, x_cf)
+            score_after = _score_candidate(model, x_cf, score_fn)
             cand = compute_candidate_metrics(
                 x=x,
                 x_cf=x_cf,
@@ -244,6 +255,7 @@ def generate_segment(
             "constraint_violation": float(best.diagnostics["constraint_violation"]),
             "constraint_breakdown": best.diagnostics["constraint_breakdown"],
             "runtime_ms": runtime_ms,
+            "score_source": "custom" if score_fn is not None else "reconstruction_score",
         }
         meta.update(build_explainability_meta(x, best.x_cf))
         return CFResult(x_cf=best.x_cf, score_cf=float(best.score_cf), meta=meta)
@@ -263,5 +275,6 @@ def generate_segment(
             ),
             "best_constraint_breakdown": best_constraint_breakdown,
             "runtime_ms": runtime_ms,
+            "score_source": "custom" if score_fn is not None else "reconstruction_score",
         },
     )

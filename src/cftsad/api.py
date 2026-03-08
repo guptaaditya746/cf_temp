@@ -321,6 +321,7 @@ class CounterfactualExplainer:
                 use_constraints_v2=self.use_constraints_v2,
                 max_delta_per_step=self.max_delta_per_step,
                 relational_linear=self.relational_linear,
+                score_fn=self.score_fn,
             )
 
         if method == "segment":
@@ -339,6 +340,7 @@ class CounterfactualExplainer:
                 use_constraints_v2=self.use_constraints_v2,
                 max_delta_per_step=self.max_delta_per_step,
                 relational_linear=self.relational_linear,
+                score_fn=self.score_fn,
             )
 
         if method == "motif":
@@ -357,6 +359,7 @@ class CounterfactualExplainer:
                 use_constraints_v2=self.use_constraints_v2,
                 max_delta_per_step=self.max_delta_per_step,
                 relational_linear=self.relational_linear,
+                score_fn=self.score_fn,
             )
 
         if method == "genetic":
