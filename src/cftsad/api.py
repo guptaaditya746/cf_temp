@@ -30,6 +30,7 @@ class CounterfactualExplainer:
         self.threshold = threshold
 
         # Common knobs (usable by all methods)
+        self.score_fn = method_kwargs.pop("score_fn", None)
         self.immutable_features = tuple(method_kwargs.pop("immutable_features", ()))
         self.bounds = dict(method_kwargs.pop("bounds", {}))
         self.random_seed = int(method_kwargs.pop("random_seed", 42))
@@ -116,6 +117,7 @@ class CounterfactualExplainer:
             model=self.model,
             normal_core=self.normal_core,
             threshold=self.threshold,
+            score_fn=self.score_fn,
             filter_factor=self.normal_core_filter_factor,
             threshold_quantile=self.normal_core_threshold_quantile,
             max_core_size=self.normal_core_max_size,
@@ -164,6 +166,9 @@ class CounterfactualExplainer:
                 return "threshold must be a numeric scalar"
             if not np.isfinite(thr) or thr < 0.0:
                 return "threshold must be finite and non-negative"
+
+        if self.score_fn is not None and not callable(self.score_fn):
+            return "score_fn must be callable when provided"
 
         if (
             not np.isfinite(self.normal_core_filter_factor)
@@ -376,6 +381,7 @@ class CounterfactualExplainer:
                 use_constraints_v2=self.use_constraints_v2,
                 max_delta_per_step=self.max_delta_per_step,
                 relational_linear=self.relational_linear,
+                score_fn=self.score_fn,
                 random_seed=self.random_seed,
             )
 

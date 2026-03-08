@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 
@@ -11,6 +11,16 @@ from cftsad.core.evolution import binary_tournament, nsga2_select
 from cftsad.core.postprocess import build_explainability_meta
 from cftsad.core.scoring import reconstruction_score
 from cftsad.types import CFFailure, CFResult
+
+
+def _score_candidate(
+    model: object,
+    x_cf: np.ndarray,
+    score_fn: Optional[Callable[[np.ndarray], float]],
+) -> float:
+    if score_fn is not None:
+        return float(score_fn(np.asarray(x_cf, dtype=np.float64)))
+    return reconstruction_score(model, x_cf)
 
 
 def _reconstruct_with_model(model: object, x: np.ndarray) -> np.ndarray:
@@ -99,6 +109,7 @@ def _evaluate_population(
     use_constraints_v2: bool,
     max_delta_per_step: Optional[float],
     relational_linear: Optional[Dict[str, tuple[int, int, float]]],
+    score_fn: Optional[Callable[[np.ndarray], float]] = None,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     n = population.shape[0]
     n_obj = 3 + int(include_smoothness_objective) + int(use_plausibility_objective)
@@ -118,7 +129,7 @@ def _evaluate_population(
             max_delta_per_step=max_delta_per_step,
             relational_linear=relational_linear,
         )
-        score = reconstruction_score(model, x_cf)
+        score = _score_candidate(model, x_cf, score_fn)
         validity_violation = max(0.0, float(score) - thr_target)
         violations[i] = float(c_v + validity_violation)
         c_break = dict(c_break)
@@ -278,6 +289,7 @@ def generate_genetic(
     use_constraints_v2: bool = True,
     max_delta_per_step: Optional[float] = None,
     relational_linear: Optional[Dict[str, tuple[int, int, float]]] = None,
+    score_fn: Optional[Callable[[np.ndarray], float]] = None,
     random_seed: int = 42,
 ) -> CFResult | CFFailure:
     t0 = time.perf_counter()
@@ -324,6 +336,7 @@ def generate_genetic(
         use_constraints_v2=bool(use_constraints_v2),
         max_delta_per_step=max_delta_per_step,
         relational_linear=relational_linear,
+        score_fn=score_fn,
     )
 
     history_best_validity = []
@@ -384,6 +397,7 @@ def generate_genetic(
             use_constraints_v2=bool(use_constraints_v2),
             max_delta_per_step=max_delta_per_step,
             relational_linear=relational_linear,
+            score_fn=score_fn,
         )
 
         keep_idx, _, _, _ = nsga2_select(
@@ -438,10 +452,12 @@ def generate_genetic(
     if ordered_valid.size > 0:
         best_local = int(ordered_valid[0])
         warning = None
+        selection_mode = "valid"
     else:
         warning = "No feasible threshold-valid solution; returning best compromise."
         compromise = np.lexsort((pareto_obj[:, 1], pareto_obj[:, 0], pareto_viol))
         best_local = int(compromise[0])
+        selection_mode = "best_compromise"
 
     best_cf = pareto_pop[best_local]
     best_obj = pareto_obj[best_local]
@@ -450,8 +466,10 @@ def generate_genetic(
 
     m = max(1, int(top_m_solutions))
     top_solutions = []
-    source_idx = ordered_valid if ordered_valid.size > 0 else np.argsort(
-        np.lexsort((pareto_obj[:, 1], pareto_obj[:, 0], pareto_viol))
+    source_idx = (
+        ordered_valid
+        if ordered_valid.size > 0
+        else np.lexsort((pareto_obj[:, 1], pareto_obj[:, 0], pareto_viol))
     )
     for i in source_idx[:m]:
         top_solutions.append(
@@ -485,6 +503,12 @@ def generate_genetic(
         "warning": warning,
         "threshold": thr,
         "valid": bool(best_obj[0] <= thr and best_viol <= 1e-12),
+        "threshold_valid": bool(best_obj[0] <= thr),
+        "constraints_feasible": bool(best_viol <= 1e-12),
+        "valid_counterfactual_found": bool(ordered_valid.size > 0),
+        "returned_best_compromise": bool(ordered_valid.size == 0),
+        "selection_mode": selection_mode,
+        "score_source": "custom" if score_fn is not None else "reconstruction_score",
         "mutation_sigma": float(mutation_sigma),
         "structured_mutation_weight": float(structured_mutation_weight),
         "use_plausibility_objective": bool(use_plausibility_objective),

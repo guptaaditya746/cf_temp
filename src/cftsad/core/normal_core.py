@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -49,6 +49,7 @@ def build_normal_core(
     model: object,
     normal_core: np.ndarray,
     threshold: Optional[float],
+    score_fn: Optional[Callable[[np.ndarray], float]] = None,
     filter_factor: float = 1.0,
     threshold_quantile: float = 0.95,
     max_core_size: Optional[int] = None,
@@ -60,7 +61,12 @@ def build_normal_core(
     n_windows = core.shape[0]
 
     all_scores = np.asarray(
-        [reconstruction_score(model, core[i]) for i in range(n_windows)],
+        [
+            float(score_fn(core[i]))
+            if score_fn is not None
+            else reconstruction_score(model, core[i])
+            for i in range(n_windows)
+        ],
         dtype=np.float64,
     )
 
