@@ -195,6 +195,19 @@ class AnomalyRepairExplainer:
         self.min_interval_length = int(min_interval_length)
         self.enforce_psd = bool(enforce_psd)
         self.rng = np.random.default_rng(random_seed)
+        self._current_interval = None
+
+    def set_interval(self, interval):
+        if interval is None:
+            self._current_interval = None
+            return
+        if len(interval) != 2:
+            raise ValueError("interval must be a (start, end) pair")
+
+        start, end = int(interval[0]), int(interval[1])
+        if start < 0 or end <= start:
+            raise ValueError("interval must satisfy 0 <= start < end")
+        self._current_interval = (start, end)
 
     def _score(self, x):
         return float(self.score_fn(np.asarray(x, dtype=np.float64)))
@@ -216,12 +229,23 @@ class AnomalyRepairExplainer:
                 diagnostics={"score_before": float(score_before)},
             )
 
-        start, end, errors = detect_anomalous_interval(
-            x_arr,
-            self.model,
-            quantile=self.interval_quantile,
-            min_length=self.min_interval_length,
-        )
+        if self._current_interval is None:
+            return CFFailure(
+                reason="missing_interval",
+                message="anomaly_repair requires an externally supplied interval",
+                diagnostics={},
+            )
+
+        start, end = self._current_interval
+        if end > x_arr.shape[0]:
+            return CFFailure(
+                reason="invalid_interval",
+                message="provided interval exceeds input window length",
+                diagnostics={
+                    "interval": (int(start), int(end)),
+                    "window_length": int(x_arr.shape[0]),
+                },
+            )
 
         original_state = np.random.get_state()
         best_candidate = None
@@ -246,11 +270,11 @@ class AnomalyRepairExplainer:
                     meta = {
                         "method": "anomaly_repair",
                         "interval": (int(start), int(end)),
+                        "interval_source": "shared_model_localizer",
                         "score_before": float(score_before),
                         "score_source": "external_score_fn",
                         "repair_samples": int(self.n_samples),
-                        "interval_quantile": float(self.interval_quantile),
-                        "peak_error": float(np.max(errors)),
+                        "shared_interval_quantile": float(self.interval_quantile),
                     }
                     return CFResult(x_cf=candidate, score_cf=float(score), meta=meta)
         except Exception as exc:

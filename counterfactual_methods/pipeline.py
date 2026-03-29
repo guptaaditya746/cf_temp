@@ -6,7 +6,10 @@ import numpy as np
 import pandas as pd
 
 from configs.defaults import ANOMALY_REPAIR_CONFIG, CFTSAD_BASE_CONFIG, CFTSAD_METHOD_CONFIGS
-from counterfactual_methods.anomaly_repair import AnomalyRepairExplainer
+from counterfactual_methods.anomaly_repair import (
+    AnomalyRepairExplainer,
+    detect_anomalous_interval,
+)
 from evaluation.reconstruction import build_score_fn
 
 from cftsad import CFFailure, CFResult, CounterfactualExplainer
@@ -163,6 +166,7 @@ def run_counterfactual_pipeline(model, splits, evaluation, eval_dir):
     print(f"Target threshold: {evaluation['window_threshold']:.4f}")
     print("Explainers initialized:", ", ".join(explainers.keys()))
 
+    anomaly_repair = explainers.get("anomaly_repair")
     results_by_index = {}
     for idx in anomaly_indices:
         idx_to_explain = int(idx)
@@ -171,6 +175,16 @@ def run_counterfactual_pipeline(model, splits, evaluation, eval_dir):
 
         print(f"\nGenerating counterfactuals for Test Window Index: {idx_to_explain}")
         print(f"Original score: {original_score:.4f}")
+
+        if anomaly_repair is not None:
+            shared_start, shared_end, _ = detect_anomalous_interval(
+                x_anomaly,
+                model,
+                quantile=float(getattr(anomaly_repair, "interval_quantile", 0.9)),
+                min_length=int(getattr(anomaly_repair, "min_interval_length", 1)),
+            )
+            anomaly_repair.set_interval((shared_start, shared_end))
+            print(f"Shared interval for this window: [{shared_start}, {shared_end})")
 
         results_by_method = run_counterfactual_benchmark(
             explainers=explainers,
