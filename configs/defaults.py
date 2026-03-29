@@ -2,6 +2,7 @@ DATA_PATH = "./artifacts/Atacama.pkl"
 VAR_LIST_PATH = "./artifacts/var_list.csv"
 
 WINDOW_SIZE = 24
+WINDOW_STRIDE = 1
 TRAIN_RATIO = 0.6
 VAL_RATIO = 0.1
 CALIB_RATIO = 0.1

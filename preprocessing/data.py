@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-from configs.defaults import CALIB_RATIO, TRAIN_RATIO, VAL_RATIO, WINDOW_SIZE
+from configs.defaults import CALIB_RATIO, TRAIN_RATIO, VAL_RATIO, WINDOW_SIZE, WINDOW_STRIDE
 
 
 def load_feature_names(path):
@@ -45,12 +45,19 @@ def scale_feature_dataframe(df_clean):
 
 
 def build_windows(scaled_data):
+    if int(WINDOW_STRIDE) <= 0:
+        raise ValueError("WINDOW_STRIDE must be a positive integer")
+
     windows = np.lib.stride_tricks.sliding_window_view(
         scaled_data,
         window_shape=(WINDOW_SIZE, scaled_data.shape[1]),
     )
     windows = windows.squeeze(axis=1)
-    print(f"Windowing complete. Tensor shape: {windows.shape}")
+    windows = windows[:: int(WINDOW_STRIDE)]
+    print(
+        f"Windowing complete. Tensor shape: {windows.shape} "
+        f"(window_size={WINDOW_SIZE}, stride={int(WINDOW_STRIDE)})"
+    )
     return windows
 
 
