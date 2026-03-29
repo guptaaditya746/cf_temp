@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 
 import numpy as np
@@ -15,7 +17,52 @@ from cftsad import CFFailure, CFResult, CounterfactualExplainer
 def _safe_log_value(value):
     if isinstance(value, (str, int, float, bool, np.integer, np.floating)):
         return value
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    elif isinstance(value, tuple):
+        value = list(value)
+    elif isinstance(value, dict):
+        value = {
+            str(key): _safe_log_value(item)
+            for key, item in value.items()
+        }
+    elif isinstance(value, list):
+        value = [_safe_log_value(item) for item in value]
+
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True)
     return str(value)
+
+
+def _append_counterfactual_log(csv_path, df_log):
+    write_kwargs = {"index": False, "quoting": csv.QUOTE_ALL}
+    if not os.path.exists(csv_path):
+        df_log.to_csv(csv_path, **write_kwargs)
+        return
+
+    existing_columns = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    new_columns = df_log.columns.tolist()
+    extra_columns = [column for column in new_columns if column not in existing_columns]
+
+    if not extra_columns:
+        df_log.reindex(columns=existing_columns).to_csv(
+            csv_path,
+            mode="a",
+            header=False,
+            **write_kwargs,
+        )
+        return
+
+    existing_df = pd.read_csv(csv_path)
+    all_columns = existing_columns + extra_columns
+    combined_df = pd.concat(
+        [
+            existing_df.reindex(columns=all_columns),
+            df_log.reindex(columns=all_columns),
+        ],
+        ignore_index=True,
+    )
+    combined_df.to_csv(csv_path, **write_kwargs)
 
 
 def build_cftsad_explainers(model, normal_core, threshold, score_fn):
@@ -91,10 +138,7 @@ def run_counterfactual_benchmark(
         rows.append(row)
 
     df_log = pd.DataFrame(rows)
-    if not os.path.exists(csv_path):
-        df_log.to_csv(csv_path, index=False)
-    else:
-        df_log.to_csv(csv_path, mode="a", header=False, index=False)
+    _append_counterfactual_log(csv_path, df_log)
 
     print(f"Counterfactual results appended to: {csv_path}")
     return results_by_method
