@@ -74,9 +74,21 @@ def sample_replacement(X, intvl, td=1, cond=None, enforce_psd=True):
                               if cond is not None and len(cond) > 0 \
                               else np.zeros((0,), dtype=int)
 
+        # Build a fixed-size context window and pad missing boundary context with NaNs.
+        # conditional_mvn will marginalize those missing observations automatically.
+        context_start = intvl[0] - td + 1
+        context_end = intvl[1] + td - 1
+        context_window = np.full((length + 2 * td - 2, dim), np.nan, dtype=float)
+        overlap_start = max(0, context_start)
+        overlap_end = min(X.shape[1], context_end)
+        if overlap_start < overlap_end:
+            dest_start = overlap_start - context_start
+            dest_end = dest_start + (overlap_end - overlap_start)
+            context_window[dest_start:dest_end, :] = X[:, overlap_start:overlap_end].T
+
         rep_mean, cov = conditional_mvn(
             rep_mean, cov,
-            X[:, intvl[0]-td+1:intvl[1]+td-1].T.ravel(),
+            context_window.ravel(),
             np.union1d(context_conditions, variable_conditions)
         )
 
@@ -125,6 +137,10 @@ def conditional_mvn(mu, S, X, d_obs):
     missing_variables = np.where(np.isnan(X[d_obs, ...]) if X.ndim == 1 else np.any(np.isnan(X[d_obs, ...]), axis=1))[0]
     if len(missing_variables) > 0:
         d_obs = [d_obs[i] for i in range(len(d_obs)) if i not in missing_variables]
+
+    if len(d_obs) == 0:
+        d_inf = np.setdiff1d(np.arange(len(mu)), d_obs)
+        return mu[d_inf, ...], S[np.ix_(d_inf, d_inf)]
 
     # Partition covariance matrix
     S11 = S[np.ix_(d_inf, d_inf)]
