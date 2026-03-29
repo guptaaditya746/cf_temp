@@ -1,5 +1,52 @@
-DATA_PATH = "./artifacts/Atacama.pkl"
-VAR_LIST_PATH = "./artifacts/var_list.csv"
+ACTIVE_DATASET = "atacama"
+
+DATASET_CONFIGS = {
+    "atacama": {
+        "data_path": "./artifacts/Atacama.pkl",
+        "var_list_path": "./artifacts/var_list.csv",
+        "time_column": "time",
+        "time_unit": "s",
+        "label_column": "label",
+        "scenario_column": None,
+        "non_feature_columns": ("time", "label"),
+        "split_mode": "temporal",
+        "resample_frequency": "h",
+        "train_scenarios": (),
+        "expected_feature_count": 6,
+        "precipitation_label_column": "precipitation (mm)",
+        "precipitation_label_threshold": 2.0,
+    },
+    "msdigit": {
+        "data_path": "./artifacts/NewLabeled.csv",
+        "var_list_path": None,
+        "time_column": "Time",
+        "time_unit": None,
+        "label_column": "anomaly_label",
+        "scenario_column": "scenario_id",
+        "non_feature_columns": ("Time", "scenario_id", "anomaly_label"),
+        "split_mode": "scenario",
+        "resample_frequency": None,
+        "train_scenarios": (4, 5, 7, 8, 14, 15),
+        "expected_feature_count": 38,
+        "precipitation_label_column": None,
+        "precipitation_label_threshold": None,
+    },
+}
+
+DATA_CONFIG = DATASET_CONFIGS[ACTIVE_DATASET]
+DATA_PATH = DATA_CONFIG["data_path"]
+VAR_LIST_PATH = DATA_CONFIG["var_list_path"]
+TIME_COLUMN = DATA_CONFIG["time_column"]
+TIME_UNIT = DATA_CONFIG["time_unit"]
+LABEL_COLUMN = DATA_CONFIG["label_column"]
+SCENARIO_COLUMN = DATA_CONFIG["scenario_column"]
+NON_FEATURE_COLUMNS = DATA_CONFIG["non_feature_columns"]
+SPLIT_MODE = DATA_CONFIG["split_mode"]
+RESAMPLE_FREQUENCY = DATA_CONFIG["resample_frequency"]
+TRAIN_SCENARIOS = DATA_CONFIG["train_scenarios"]
+EXPECTED_FEATURE_COUNT = DATA_CONFIG["expected_feature_count"]
+PRECIPITATION_LABEL_COLUMN = DATA_CONFIG["precipitation_label_column"]
+PRECIPITATION_LABEL_THRESHOLD = DATA_CONFIG["precipitation_label_threshold"]
 
 WINDOW_SIZE = 24
 WINDOW_STRIDE = 1
@@ -14,7 +61,7 @@ THRESHOLD_PERCENTILE = 99
 MODEL_NAME = "lstm_autoencoder"
 MODEL_CONFIG = {
     "seq_len": WINDOW_SIZE,
-    "n_features": 6,
+    "n_features": None,
     "hidden_dim": 32,
     "latent_dim": 8,
     "lr": 1e-3,

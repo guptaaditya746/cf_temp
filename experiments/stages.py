@@ -2,7 +2,7 @@ import os
 
 import numpy as np
 
-from configs.defaults import DATA_PATH, MODEL_CONFIG, MODEL_NAME, VAR_LIST_PATH
+from configs.defaults import ACTIVE_DATASET, DATA_PATH, MODEL_CONFIG, MODEL_NAME, VAR_LIST_PATH
 from experiments.runtime import configure_runtime, make_output_dir
 from utils.storage import ensure_dir, load_json, save_json
 
@@ -31,15 +31,16 @@ def run_preprocessing(run_dir=None):
     ensure_dir(run_dir)
 
     feature_names = load_feature_names(VAR_LIST_PATH)
-    df_clean = load_and_clean_dataframe(DATA_PATH, feature_names, run_dir)
-    scaled_data, _ = scale_feature_dataframe(df_clean)
-    windows = build_windows(scaled_data)
-    splits = split_windows(windows)
+    df_clean, feature_names = load_and_clean_dataframe(DATA_PATH, feature_names, run_dir)
+    scaled_data, _ = scale_feature_dataframe(df_clean, feature_names)
+    window_payload = build_windows(scaled_data, feature_names)
+    splits = split_windows(window_payload)
     save_split_arrays(run_dir, splits)
 
     save_json(
         os.path.join(run_dir, "preprocessing_metadata.json"),
         {
+            "active_dataset": ACTIVE_DATASET,
             "feature_names": feature_names,
             "data_path": DATA_PATH,
             "var_list_path": VAR_LIST_PATH,
@@ -57,7 +58,9 @@ def run_training_stage(run_dir):
     sample_batch = next(iter(data_module.train_dataloader()))
     print(f"Batch shape from train_dataloader: {sample_batch.shape}")
 
-    model = build_model(MODEL_NAME, MODEL_CONFIG)
+    model_config = dict(MODEL_CONFIG)
+    model_config["n_features"] = int(splits["train"].shape[-1])
+    model = build_model(MODEL_NAME, model_config)
     print(model)
     best_model_path = train_model(model, data_module, run_dir)
 
@@ -65,6 +68,7 @@ def run_training_stage(run_dir):
         os.path.join(run_dir, "training_metadata.json"),
         {
             "model_name": MODEL_NAME,
+            "model_config": model_config,
             "best_model_path": best_model_path,
         },
     )
