@@ -6,6 +6,15 @@ from cftsad.core.scoring import reconstruction_errors_per_timestep
 from cftsad.types import CFFailure, CFResult
 
 
+def _stabilize_covariance(cov, min_eig=1e-8):
+    cov = np.asarray(cov, dtype=float)
+    cov = np.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
+    cov = 0.5 * (cov + cov.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eigvals = np.maximum(eigvals, float(min_eig))
+    return (eigvecs * eigvals[None, :]) @ eigvecs.T
+
+
 def sample_replacement(X, intvl, td=1, cond=None, enforce_psd=True):
     """ Samples a replacement for a given interval, taking inter-variable and inter-temporal correlations into account.
 
@@ -63,9 +72,7 @@ def sample_replacement(X, intvl, td=1, cond=None, enforce_psd=True):
 
     # Enforce covariance matrix to be PSD
     if enforce_psd:
-        eigvals, eigvec = np.linalg.eigh(cov)
-        if np.any(eigvals < 0):
-            cov = (eigvec * np.maximum(0, eigvals[None, :])) @ eigvec.T
+        cov = _stabilize_covariance(cov)
 
     # Condition on observed variables and left and right context
     if td > 1:
@@ -93,6 +100,8 @@ def sample_replacement(X, intvl, td=1, cond=None, enforce_psd=True):
         )
 
     # Sample replacement
+    if enforce_psd:
+        cov = _stabilize_covariance(cov)
     return mvn.rvs(rep_mean, cov).reshape(length, dim - (len(cond) if cond is not None else 0)).T
 
 
@@ -150,8 +159,10 @@ def conditional_mvn(mu, S, X, d_obs):
     # Compute conditional mean and covariance
     if X.ndim > 1 and mu.ndim == 1:
         mu = mu[:, None]
-    mu_cond = mu[d_inf, ...] + S12 @ np.linalg.solve(S22, X[d_obs, ...] - mu[d_obs, ...])
-    S_cond = S11 - S12 @ np.linalg.solve(S22, S12.T)
+    solve_term = np.linalg.pinv(S22)
+    mu_cond = mu[d_inf, ...] + S12 @ solve_term @ (X[d_obs, ...] - mu[d_obs, ...])
+    S_cond = S11 - S12 @ solve_term @ S12.T
+    S_cond = _stabilize_covariance(S_cond)
     return mu_cond, S_cond
 
 
