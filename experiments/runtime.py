@@ -10,20 +10,36 @@ def make_output_dir(base_dir="results"):
     return output_dir
 
 
+def detect_runtime():
+    import torch
+
+    if torch.cuda.is_available():
+        return {
+            "device": torch.device("cuda"),
+            "accelerator": "cuda",
+            "devices": 1,
+        }
+    if torch.backends.mps.is_available():
+        return {
+            "device": torch.device("mps"),
+            "accelerator": "mps",
+            "devices": 1,
+        }
+    return {
+        "device": torch.device("cpu"),
+        "accelerator": "cpu",
+        "devices": 1,
+    }
+
+
 def configure_runtime():
     import matplotlib.pyplot as plt
     import seaborn as sns
-    import torch
 
-    device = torch.device(
-        "mps"
-        if torch.backends.mps.is_available()
-        else "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    runtime = detect_runtime()
+    device = runtime["device"]
     warnings.filterwarnings("ignore")
     plt.style.use("ggplot")
     sns.set_theme(style="whitegrid")
-    print(f"Currently using: {device}")
+    print(f"Currently using: {device} ({runtime['accelerator']})")
     return device

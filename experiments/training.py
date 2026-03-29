@@ -5,6 +5,7 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 
 from configs.defaults import DATA_BATCH_SIZE, NUM_WORKERS, TRAINER_CONFIG
+from experiments.runtime import detect_runtime
 from models.data_module import AtacamaDataModule
 
 
@@ -22,6 +23,7 @@ def build_data_module(splits):
 
 
 def build_trainer(output_dir):
+    runtime = detect_runtime()
     logger = CSVLogger(save_dir=output_dir, name="lstm_ae_logs")
     checkpoint_callback = ModelCheckpoint(
         dirpath=os.path.join(output_dir, "checkpoints"),
@@ -38,8 +40,10 @@ def build_trainer(output_dir):
     )
     trainer = pl.Trainer(
         max_epochs=TRAINER_CONFIG["max_epochs"],
-        accelerator="auto",
-        devices=TRAINER_CONFIG["devices"],
+        accelerator=runtime["accelerator"],
+        devices=TRAINER_CONFIG["devices"]
+        if TRAINER_CONFIG["devices"] != "auto"
+        else runtime["devices"],
         logger=logger,
         callbacks=[checkpoint_callback, early_stop_callback],
         enable_progress_bar=True,

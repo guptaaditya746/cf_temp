@@ -21,7 +21,7 @@ MODEL_CONFIG = {
 
 TRAINER_CONFIG = {
     "max_epochs": 50,
-    "devices": 1,
+    "devices": "auto",
     "log_every_n_steps": 10,
 }
 
@@ -68,4 +68,13 @@ CFTSAD_METHOD_CONFIGS = {
         "early_stop_patience": 15,
         "fallback_methods": ("segment", "motif", "nearest"),
     },
+}
+
+ANOMALY_REPAIR_CONFIG = {
+    "td": 2,
+    "n_samples": 25,
+    "interval_quantile": 0.9,
+    "min_interval_length": 2,
+    "enforce_psd": True,
+    "random_seed": 42,
 }

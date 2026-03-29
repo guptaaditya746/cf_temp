@@ -3,7 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 
-from configs.defaults import CFTSAD_BASE_CONFIG, CFTSAD_METHOD_CONFIGS
+from configs.defaults import ANOMALY_REPAIR_CONFIG, CFTSAD_BASE_CONFIG, CFTSAD_METHOD_CONFIGS
+from counterfactual_methods.anomaly_repair import AnomalyRepairExplainer
 
 try:
     from cftsad import CFFailure, CFResult, CounterfactualExplainer
@@ -32,6 +33,11 @@ def build_cftsad_explainers(model, normal_core, threshold):
             **base_kwargs,
             **overrides,
         )
+    explainers["anomaly_repair"] = AnomalyRepairExplainer(
+        model=model,
+        threshold=float(threshold),
+        **ANOMALY_REPAIR_CONFIG,
+    )
     return explainers
 
 
