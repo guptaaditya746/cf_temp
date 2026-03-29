@@ -1,12 +1,9 @@
 import numpy as np
 from scipy.stats import multivariate_normal as mvn
 
-try:
-    from cftsad.core.scoring import reconstruction_errors_per_timestep, reconstruction_score
-    from cftsad.types import CFFailure, CFResult
-except Exception:
-    from src.cftsad.core.scoring import reconstruction_errors_per_timestep, reconstruction_score
-    from src.cftsad.types import CFFailure, CFResult
+
+from cftsad.core.scoring import reconstruction_errors_per_timestep
+from cftsad.types import CFFailure, CFResult
 
 
 def sample_replacement(X, intvl, td=1, cond=None, enforce_psd=True):
@@ -179,7 +176,7 @@ class AnomalyRepairExplainer:
         model,
         threshold,
         *,
-        score_fn=None,
+        score_fn,
         td=2,
         n_samples=25,
         interval_quantile=0.9,
@@ -189,6 +186,8 @@ class AnomalyRepairExplainer:
     ):
         self.model = model
         self.threshold = float(threshold)
+        if not callable(score_fn):
+            raise ValueError("anomaly_repair requires a callable score_fn")
         self.score_fn = score_fn
         self.td = int(td)
         self.n_samples = int(n_samples)
@@ -198,9 +197,7 @@ class AnomalyRepairExplainer:
         self.rng = np.random.default_rng(random_seed)
 
     def _score(self, x):
-        if self.score_fn is not None:
-            return float(self.score_fn(np.asarray(x, dtype=np.float64)))
-        return reconstruction_score(self.model, x)
+        return float(self.score_fn(np.asarray(x, dtype=np.float64)))
 
     def explain(self, x):
         x_arr = np.asarray(x, dtype=np.float64)
@@ -250,7 +247,7 @@ class AnomalyRepairExplainer:
                         "method": "anomaly_repair",
                         "interval": (int(start), int(end)),
                         "score_before": float(score_before),
-                        "score_source": "custom" if self.score_fn is not None else "reconstruction_score",
+                        "score_source": "external_score_fn",
                         "repair_samples": int(self.n_samples),
                         "interval_quantile": float(self.interval_quantile),
                         "peak_error": float(np.max(errors)),

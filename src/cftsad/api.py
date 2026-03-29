@@ -21,16 +21,17 @@ class CounterfactualExplainer:
         method: Literal["nearest", "segment", "motif", "genetic"],
         model,
         normal_core: np.ndarray,
+        score_fn,
         threshold: Optional[float] = None,
         **method_kwargs,
     ):
         self.method = str(method)
         self.model = model
         self.normal_core = np.asarray(normal_core)
+        self.score_fn = score_fn
         self.threshold = threshold
 
         # Common knobs (usable by all methods)
-        self.score_fn = method_kwargs.pop("score_fn", None)
         self.immutable_features = tuple(method_kwargs.pop("immutable_features", ()))
         self.bounds = dict(method_kwargs.pop("bounds", {}))
         self.random_seed = int(method_kwargs.pop("random_seed", 42))
@@ -167,8 +168,8 @@ class CounterfactualExplainer:
             if not np.isfinite(thr) or thr < 0.0:
                 return "threshold must be finite and non-negative"
 
-        if self.score_fn is not None and not callable(self.score_fn):
-            return "score_fn must be callable when provided"
+        if not callable(self.score_fn):
+            return "score_fn is required and must be callable"
 
         if (
             not np.isfinite(self.normal_core_filter_factor)

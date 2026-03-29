@@ -99,12 +99,16 @@ model = lambda x: x  # replace with your reconstruction model
 core = np.load("normal_core.npy")  # (K, L, F)
 x = np.load("window.npy")          # (L, F)
 
+def score_fn(window: np.ndarray) -> float:
+    recon = np.asarray(model(window))
+    return float(np.mean((window - recon) ** 2))
+
 explainer = CounterfactualExplainer(
     method="genetic",
     model=model,
     normal_core=core,
+    score_fn=score_fn,  # required: use the same scoring function as evaluation
     threshold=None,
-    score_fn=None,  # optional custom scoring function
     population_size=100,
     n_generations=50,
 )
@@ -123,7 +127,7 @@ else:
 - input accepted by `cftsad`: `(L, F)` (and `(1, L, F)` fallback is supported)
 - output expected: same shape as input window (`(L, F)` or squeezable `(1, L, F)`)
 
-`cftsad` computes anomaly/reconstruction score internally.
+`score_fn` is required so counterfactual generation uses the exact same window-level scoring rule as evaluation.
 
 ### PyTorch usage (recommended)
 
@@ -148,6 +152,7 @@ explainer = CounterfactualExplainer(
     method="nearest",
     model=model,
     normal_core=core,
+    score_fn=score_fn,
     threshold=None,
 )
 ```
@@ -197,8 +202,8 @@ CounterfactualExplainer(
     method="nearest",  # "nearest" | "segment" | "motif" | "genetic"
     model=model,
     normal_core=core,
+    score_fn=score_fn,              # required: shared evaluation scoring function
     threshold=None,
-    score_fn=None,                 # optional custom scoring function
     immutable_features=(0,),        # optional
     bounds={1: (-3.0, 3.0)},        # optional
     random_seed=42,                 # optional
@@ -210,8 +215,8 @@ CounterfactualExplainer(
 - `method`
 - `model`
 - `normal_core`
+- `score_fn`: required callable used for threshold/core building and counterfactual scoring
 - `threshold`: if `None`, estimated from normal core
-- `score_fn`: optional callable override for anomaly scoring during threshold/core building
 - `immutable_features`
 - `bounds`
 - `random_seed`
@@ -305,6 +310,7 @@ explainer = CounterfactualExplainer(
     method="segment",
     model=model,
     normal_core=core,
+    score_fn=score_fn,
     threshold=0.1,
     enable_fallback_chain=True,
     fallback_methods=("motif", "nearest", "genetic"),
@@ -376,3 +382,10 @@ explainer.save_core("/tmp/cftsad_core.npz")
 loaded = CounterfactualExplainer.load_core("/tmp/cftsad_core.npz")
 print(loaded.keys())
 ```
+
+
+
+
+### legacy
+1. genetic : mostly its failing , so could be worked on latter on, but for now the probalabe cause its trying ot optiomize mostly validity
+2.

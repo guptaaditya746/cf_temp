@@ -59,15 +59,15 @@ CFTSAD_METHOD_CONFIGS = {
         "motif_use_affine_fit": True,
         "fallback_methods": ("segment", "nearest", "genetic"),
     },
-    "genetic": {
-        "population_size": 50,
-        "n_generations": 20,
-        "use_plausibility_objective": True,
-        "structured_mutation_weight": 0.35,
-        "top_m_solutions": 5,
-        "early_stop_patience": 15,
-        "fallback_methods": ("segment", "motif", "nearest"),
-    },
+    # "genetic": {
+    #     "population_size": 50,
+    #     "n_generations": 20,
+    #     "use_plausibility_objective": True,
+    #     "structured_mutation_weight": 0.35,
+    #     "top_m_solutions": 5,
+    #     "early_stop_patience": 15,
+    #     "fallback_methods": ("segment", "motif", "nearest"),
+    # },
 }
 
 ANOMALY_REPAIR_CONFIG = {

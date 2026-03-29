@@ -5,11 +5,11 @@ import pandas as pd
 
 from configs.defaults import ANOMALY_REPAIR_CONFIG, CFTSAD_BASE_CONFIG, CFTSAD_METHOD_CONFIGS
 from counterfactual_methods.anomaly_repair import AnomalyRepairExplainer
+from utils.scoring import build_score_fn
 
-try:
-    from cftsad import CFFailure, CFResult, CounterfactualExplainer
-except Exception:
-    from src.cftsad import CFFailure, CFResult, CounterfactualExplainer
+from cftsad import CFFailure, CFResult, CounterfactualExplainer
+
+
 
 
 def _safe_log_value(value):
@@ -18,10 +18,11 @@ def _safe_log_value(value):
     return str(value)
 
 
-def build_cftsad_explainers(model, normal_core, threshold):
+def build_cftsad_explainers(model, normal_core, threshold, score_fn):
     base_kwargs = {
         "model": model,
         "normal_core": normal_core,
+        "score_fn": score_fn,
         "threshold": float(threshold),
         **CFTSAD_BASE_CONFIG,
     }
@@ -36,6 +37,7 @@ def build_cftsad_explainers(model, normal_core, threshold):
     explainers["anomaly_repair"] = AnomalyRepairExplainer(
         model=model,
         threshold=float(threshold),
+        score_fn=score_fn,
         **ANOMALY_REPAIR_CONFIG,
     )
     return explainers
@@ -99,6 +101,7 @@ def run_counterfactual_benchmark(
 
 
 def run_counterfactual_pipeline(model, splits, evaluation, eval_dir):
+    score_fn = build_score_fn(model)
     anomaly_indices = np.where(
         evaluation["test_window_mse"] > evaluation["window_threshold"]
     )[0]
@@ -109,6 +112,7 @@ def run_counterfactual_pipeline(model, splits, evaluation, eval_dir):
         model=model,
         normal_core=splits["calib"],
         threshold=evaluation["window_threshold"],
+        score_fn=score_fn,
     )
 
     print(f"Found {len(anomaly_indices)} anomaly windows in test set.")

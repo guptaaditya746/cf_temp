@@ -94,6 +94,7 @@ CounterfactualExplainer(
     ],
     model,
     normal_core: np.ndarray,  # shape (K, L, F)
+    score_fn,                 # required
     threshold: Optional[float] = None,
     **method_kwargs
 )
@@ -451,6 +452,7 @@ explainer = CounterfactualExplainer(
     method="generative",
     model=model,
     normal_core=core,
+    score_fn=score_fn,
     threshold=None,
     max_mask_ratio=0.3,
 )
@@ -468,6 +470,7 @@ explainer = CounterfactualExplainer(
     method="comte",
     model=model,
     normal_core=core,
+    score_fn=score_fn,
     threshold=None,
 )
 

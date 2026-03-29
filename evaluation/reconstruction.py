@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from configs.defaults import THRESHOLD_PERCENTILE
+from utils.scoring import calculate_errors
 
 
 def run_model_inference(model, dataloader, device):
@@ -13,13 +14,6 @@ def run_model_inference(model, dataloader, device):
             batch = batch.to(device)
             outputs.append(model(batch).cpu().numpy())
     return np.concatenate(outputs, axis=0)
-
-
-def calculate_errors(true_data, pred_data):
-    squared_error = np.square(true_data - pred_data)
-    feature_mse = np.mean(squared_error, axis=1)
-    window_mse = np.mean(squared_error, axis=(1, 2))
-    return feature_mse, window_mse
 
 
 def evaluate_reconstruction_model(model, data_module, splits, device):
