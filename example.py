@@ -1,271 +1,140 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# ## end-to-end pipeline in a way that matches the Darban et al. reconstruction-based TSAD framing
-
-
-
-# In[1]:
-
-
-
-
-# Goal: Train an unsupervised reconstruction model on normal behavior and detect collective (subsequence) anomalies as contiguous events in a multivariate time series. The system produces timestamp-level anomaly scores (for thresholding)
-
-# In[2]:
-
-
-import cftsad
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
 import os
-
-
-
-import random
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-# Deep Learning Framework (Pick your flavor)
-import torch
-import torch.nn as nn
-
-
-# For PyTorch
-device = torch.device("mps" if torch.backends.mps.is_available()
-                      else "cuda" if torch.cuda.is_available()
-                      else "cpu")
-
-# For TensorFlow
-
-
-print(f"Currently using: {device}")
-
-# Ensure plots show up inside the notebook
-#get_ipython().run_line_magic('matplotlib', 'inline')
-#get_ipython().run_line_magic('config', "InlineBackend.figure_format = 'retina' # High-res plots")
-
-# Ignore annoying warnings (e.g., DeprecationWarnings)
 import warnings
-warnings.filterwarnings('ignore')
-
-# Visual style
-plt.style.use('ggplot')
-sns.set_theme(style="whitegrid")
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[3]:
-
-
 from datetime import datetime
 
-# Create a unique run ID for saving results
-RUN_ID = datetime.now().strftime("%Y%m%d-%H%M%S")
-OUTPUT_DIR = f"results/run_{RUN_ID}"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-print(f"Results for this session will be stored in: {OUTPUT_DIR}")
-
-
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
-import numpy as np
-import os
-
-# --- 1. Ingest ---
-data_path = './artifacts/ /Atacama.pkl'
-var_list_path = './artifacts/var_list.csv'
-
-# Load expected features
-with open(var_list_path, 'r') as f:
-    FEATURES = [line.strip() for line in f.readlines() if line.strip()]
-
-df = pd.read_pickle(data_path)
-
-# --- 2. Timestamp Alignment ---
-# Convert UNIX timestamp float to datetime and set as index
-df['time'] = pd.to_datetime(df['time'], unit='s')
-df = df.set_index('time')
-df = df.sort_index()
-
-# --- 3. Quality Assurance (QA) ---
-# Remove duplicates
-df = df[~df.index.duplicated(keep='first')]
-
-# Enforce consistent hourly sampling frequency
-df = df.asfreq('h')
-
-# Resolve missing values (Forward fill short gaps to prevent leakage, median for the rest)
-df[FEATURES] = df[FEATURES].ffill(limit=3)
-df[FEATURES] = df[FEATURES].fillna(df[FEATURES].median())
-
-# Handle labels (Binarize anomalies based on Readme: > 2.0mm rain)
-df['label'] = df['label'].fillna(0).astype(int)
-df.loc[df['precipitation (mm)'] > 2.0, 'label'] = 1
-
-# --- 4. Freeze Schema ---
-# Lock the ordering: Features first, then label.
-# This exact order will be reused for all splits.
-FINAL_COLUMNS = FEATURES + ['label']
-df_clean = df[FINAL_COLUMNS]
-
-# Save this checkpoint to your tracking directory
-df_clean.to_pickle(f"{OUTPUT_DIR}/01_ingested_qa_data.pkl")
-
-print(f"Cleaned Shape: {df_clean.shape}")
-print(f"Schema Locked. Features: {FEATURES}")
-df_clean.head()
-
-
-# In[5]:
-
-
-from sklearn.preprocessing import StandardScaler
-import joblib
-
-# 1. Drop the label column completely
-df_features = df_clean.drop(columns=['label'])
-
-# 2. Determine the training cutoff index for fitting the scaler
-total_len = len(df_features)
-train_cutoff = int(total_len * 0.6)
-
-# 3. Fit scaler ONLY on the training slice
-scaler = StandardScaler()
-scaler.fit(df_features.iloc[:train_cutoff])
-
-# 4. Transform the entire dataset at once
-scaled_data = scaler.transform(df_features)
-
-# Save the scaler to your tracking directory so evaluation can use it later
-# joblib.dump(scaler, f"{OUTPUT_DIR}/scaler.pkl")
-
-print(f"Data scaled. Scaler fit on first {train_cutoff} rows strictly.")
-
-
-# In[6]:
-
-
-import numpy as np
-
-window_size = 24  # Lookback of 24 hours
-stride = 1        # Slide forward by 1 hour at a time
-
-# Create rolling windows over the 2D scaled data
-# Output shape: (num_windows, features, window_size)
-windows = np.lib.stride_tricks.sliding_window_view(
-    scaled_data,
-    window_shape=(window_size, scaled_data.shape[1])
-)
-
-# Squeeze and transpose to get the standard PyTorch shape: (Batch, Sequence_Length, Features)
-windows = windows.squeeze(axis=1)
-
-print(f"Windowing complete. Tensor shape: {windows.shape}")
-
-
-# In[7]:
-
-
-n_windows = len(windows)
-
-# Calculate split indices based on the windowed array length
-# 60% Train, 10% Val, 10% Calib, 20% Test
-val_start = int(n_windows * 0.6)
-calib_start = val_start + int(n_windows * 0.1)
-test_start = calib_start + int(n_windows * 0.1)
-
-# Slice the arrays
-X_train = windows[:val_start]
-X_val = windows[val_start:calib_start]
-X_calib = windows[calib_start:test_start]
-X_test = windows[test_start:]
-
-# Sanity check the shapes
-print(f"X_train shape: {X_train.shape}")
-print(f"X_val shape:   {X_val.shape}")
-print(f"X_calib shape: {X_calib.shape}")
-print(f"X_test shape:  {X_test.shape}")
-
-# Save the windowed splits to your results directory
-np.save(f"{OUTPUT_DIR}/X_train.npy", X_train)
-np.save(f"{OUTPUT_DIR}/X_val.npy", X_val)
-np.save(f"{OUTPUT_DIR}/X_calib.npy", X_calib)
-np.save(f"{OUTPUT_DIR}/X_test.npy", X_test)
-
-
-# In[8]:
-
-
-import torch
-from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
+import seaborn as sns
+import torch
+import torch.nn as nn
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+from sklearn.preprocessing import StandardScaler
+from torch.utils.data import DataLoader, Dataset
+
+try:
+    from cftsad import CFFailure, CFResult, CounterfactualExplainer
+except Exception:
+    from src.cftsad import CFFailure, CFResult, CounterfactualExplainer
+
+
+DATA_PATH = "./artifacts/ /Atacama.pkl"
+VAR_LIST_PATH = "./artifacts/var_list.csv"
+
+WINDOW_SIZE = 24
+TRAIN_RATIO = 0.6
+VAL_RATIO = 0.1
+CALIB_RATIO = 0.1
+
+DATA_BATCH_SIZE = 128
+NUM_WORKERS = 8
+THRESHOLD_PERCENTILE = 99
+
+MODEL_NAME = "lstm_autoencoder"
+MODEL_CONFIG = {
+    "seq_len": WINDOW_SIZE,
+    "n_features": 6,
+    "hidden_dim": 32,
+    "latent_dim": 8,
+    "lr": 1e-3,
+}
+
+TRAINER_CONFIG = {
+    "max_epochs": 50,
+    "devices": 1,
+    "log_every_n_steps": 10,
+}
+
+CFTSAD_BASE_CONFIG = {
+    "use_constraints_v2": True,
+    "enable_fallback_chain": False,
+    "fallback_retry_budget": 2,
+    "normal_core_threshold_quantile": 0.95,
+    "normal_core_filter_factor": 1.0,
+    "normal_core_max_size": 100,
+    "normal_core_use_diversity_sampling": True,
+    "random_seed": 42,
+}
+
+CFTSAD_METHOD_CONFIGS = {
+    "nearest": {
+        "nearest_top_k": 10,
+        "nearest_alpha_steps": 5,
+        "nearest_use_weighted_distance": True,
+        "fallback_methods": ("segment", "motif", "genetic"),
+    },
+    "segment": {
+        "segment_smoothing": True,
+        "segment_n_candidates": 4,
+        "segment_top_k_donors": 8,
+        "segment_context_width": 2,
+        "segment_crossfade_width": 3,
+        "fallback_methods": ("motif", "nearest", "genetic"),
+    },
+    "motif": {
+        "motif_top_k": 5,
+        "motif_n_segments": 2,
+        "motif_length_factors": (0.75, 1.0, 1.25),
+        "motif_context_weight": 0.2,
+        "motif_use_affine_fit": True,
+        "fallback_methods": ("segment", "nearest", "genetic"),
+    },
+    "genetic": {
+        "population_size": 50,
+        "n_generations": 20,
+        "use_plausibility_objective": True,
+        "structured_mutation_weight": 0.35,
+        "top_m_solutions": 5,
+        "early_stop_patience": 15,
+        "fallback_methods": ("segment", "motif", "nearest"),
+    },
+}
+
 
 class UnsupervisedTimeSeriesDataset(Dataset):
-    """
-    A simple dataset that only yields the input feature windows.
-    """
     def __init__(self, data_array):
-        # Convert the numpy array to a PyTorch float32 tensor
         self.data = torch.tensor(data_array, dtype=torch.float32)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # Strictly returning only the feature window: shape (window_size, num_features)
         return self.data[idx]
 
 
-# In[9]:
-
-
 class AtacamaDataModule(pl.LightningDataModule):
-    def __init__(self, X_train, X_val, X_calib, X_test, batch_size=64, num_workers=2):
+    def __init__(self, x_train, x_val, x_calib, x_test, batch_size=64, num_workers=2):
         super().__init__()
-        self.X_train = X_train
-        self.X_val = X_val
-        self.X_calib = X_calib
-        self.X_test = X_test
+        self.x_train = x_train
+        self.x_val = x_val
+        self.x_calib = x_calib
+        self.x_test = x_test
         self.batch_size = batch_size
         self.num_workers = num_workers
 
     def setup(self, stage=None):
-        # Assign train/val datasets for use in dataloaders
-        if stage == 'fit' or stage is None:
-            self.train_dataset = UnsupervisedTimeSeriesDataset(self.X_train)
-            self.val_dataset = UnsupervisedTimeSeriesDataset(self.X_val)
+        if stage == "fit" or stage is None:
+            self.train_dataset = UnsupervisedTimeSeriesDataset(self.x_train)
+            self.val_dataset = UnsupervisedTimeSeriesDataset(self.x_val)
 
-        # Assign test dataset for use in dataloader
-        if stage == 'test' or stage is None:
-            self.test_dataset = UnsupervisedTimeSeriesDataset(self.X_test)
+        if stage == "test" or stage is None:
+            self.test_dataset = UnsupervisedTimeSeriesDataset(self.x_test)
 
-        # Assign calibration dataset (can be used in predict or a custom stage)
-        if stage == 'predict' or stage is None:
-            self.calib_dataset = UnsupervisedTimeSeriesDataset(self.X_calib)
+        if stage == "predict" or stage is None:
+            self.calib_dataset = UnsupervisedTimeSeriesDataset(self.x_calib)
 
     def train_dataloader(self):
-        # Shuffle is True ONLY for the training set
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
 
     def val_dataloader(self):
@@ -274,7 +143,7 @@ class AtacamaDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
 
     def test_dataloader(self):
@@ -283,54 +152,23 @@ class AtacamaDataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
 
     def predict_dataloader(self):
-        # We can map your 'calibration' split to the predict dataloader
         return DataLoader(
             self.calib_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True
+            pin_memory=True,
         )
 
-
-# In[10]:
-
-
-# Instantiate the DataModule
-# We use the arrays (X_train, X_val, X_calib, X_test) created in the windowing step
-data_module = AtacamaDataModule(
-    X_train=X_train,
-    X_val=X_val,
-    X_calib=X_calib,
-    X_test=X_test,
-    batch_size=128,  # Adjust based on your GPU memory
-    num_workers=8    # Usually set to number of CPU cores
-)
-
-# Call setup manually if you want to test the dataloaders before training
-data_module.setup()
-
-# Quick sanity check on the dataloader output
-sample_batch = next(iter(data_module.train_dataloader()))
-print(f"Batch shape from train_dataloader: {sample_batch.shape}")
-# Expected output: torch.Size([128, 24, 6]) -> (Batch_Size, Window_Size, Num_Features)
-
-
-# In[11]:
-
-
-import torch
-import torch.nn as nn
-import pytorch_lightning as pl
 
 class TimeSeriesAutoencoder(pl.LightningModule):
     def __init__(self, seq_len=24, n_features=6, hidden_dim=64, latent_dim=16, lr=1e-3):
         super().__init__()
-        self.save_hyperparameters() # Logs these params automatically to TensorBoard/W&B
+        self.save_hyperparameters()
 
         self.seq_len = seq_len
         self.n_features = n_features
@@ -338,367 +176,320 @@ class TimeSeriesAutoencoder(pl.LightningModule):
         self.latent_dim = latent_dim
         self.lr = lr
 
-        # --- ENCODER ---
         self.encoder_lstm = nn.LSTM(
             input_size=self.n_features,
             hidden_size=self.hidden_dim,
-            batch_first=True
+            batch_first=True,
         )
         self.encoder_linear = nn.Linear(self.hidden_dim, self.latent_dim)
 
-        # --- DECODER ---
-        # The decoder takes the latent vector, so we need to expand it back to seq_len
         self.decoder_lstm = nn.LSTM(
             input_size=self.latent_dim,
             hidden_size=self.hidden_dim,
-            batch_first=True
+            batch_first=True,
         )
         self.decoder_linear = nn.Linear(self.hidden_dim, self.n_features)
-
-        # --- LOSS FUNCTION ---
         self.criterion = nn.MSELoss()
 
     def encode(self, x):
-        # x shape: (Batch, Seq_Len, Features)
         _, (hidden, _) = self.encoder_lstm(x)
-        # hidden shape: (1, Batch, Hidden_Dim) -> squeeze to (Batch, Hidden_Dim)
         hidden = hidden.squeeze(0)
         latent = self.encoder_linear(hidden)
-        # latent shape: (Batch, Latent_Dim)
         return latent
 
     def decode(self, latent):
-        # Repeat the latent vector for the length of the sequence
-        # latent shape: (Batch, Latent_Dim) -> (Batch, Seq_Len, Latent_Dim)
         latent_repeated = latent.unsqueeze(1).repeat(1, self.seq_len, 1)
-
         decoder_out, _ = self.decoder_lstm(latent_repeated)
-        # decoder_out shape: (Batch, Seq_Len, Hidden_Dim)
-
         reconstruction = self.decoder_linear(decoder_out)
-        # reconstruction shape: (Batch, Seq_Len, Features)
         return reconstruction
 
     def forward(self, x):
-        # The full pipeline: encode -> decode
         latent = self.encode(x)
         reconstruction = self.decode(latent)
         return reconstruction
 
     def training_step(self, batch, batch_idx):
-        # batch is our windowed tensor 'x'
-        x = batch
-        x_hat = self(x)
-        loss = self.criterion(x_hat, x)
-
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        x_hat = self(batch)
+        loss = self.criterion(x_hat, batch)
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x = batch
-        x_hat = self(x)
-        loss = self.criterion(x_hat, x)
-
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        x_hat = self(batch)
+        loss = self.criterion(x_hat, batch)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 
-# In[12]:
+MODEL_REGISTRY = {
+    "lstm_autoencoder": TimeSeriesAutoencoder,
+}
 
 
-# Create the model instance
-# seq_len = 24 (your window size), n_features = length of your frozen schema
-model = TimeSeriesAutoencoder(
-    seq_len=24,
-    n_features=6,
-    hidden_dim=32,   # Compressing 6 features down
-    latent_dim=8,    # Final bottleneck size
-    lr=1e-3
-)
-
-print(model)
+def make_output_dir():
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = f"results/run_{run_id}"
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
 
 
-# In[13]:
+def configure_runtime():
+    device = torch.device(
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+    warnings.filterwarnings("ignore")
+    plt.style.use("ggplot")
+    sns.set_theme(style="whitegrid")
+    print(f"Currently using: {device}")
+    return device
 
 
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import CSVLogger
-import os
-
-# 1. Route logs to the unified tracking folder
-logger = CSVLogger(save_dir=OUTPUT_DIR, name="lstm_ae_logs")
-
-# 2. Save only the best model based on validation loss
-checkpoint_callback = ModelCheckpoint(
-    dirpath=os.path.join(OUTPUT_DIR, "checkpoints"),
-    filename="best-model-{epoch:02d}-{val_loss:.4f}",
-    save_top_k=1,
-    monitor="val_loss",
-    mode="min"
-)
-
-# 3. Stop training if the model stops improving for 5 epochs
-early_stop_callback = EarlyStopping(
-    monitor="val_loss",
-    patience=5,
-    verbose=True,
-    mode="min"
-)
+def load_feature_names(path):
+    with open(path, "r") as handle:
+        return [line.strip() for line in handle.readlines() if line.strip()]
 
 
-# In[14]:
+def load_and_clean_dataframe(data_path, feature_names, output_dir):
+    df = pd.read_pickle(data_path)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df = df.set_index("time").sort_index()
+    df = df[~df.index.duplicated(keep="first")]
+    df = df.asfreq("h")
+
+    df[feature_names] = df[feature_names].ffill(limit=3)
+    df[feature_names] = df[feature_names].fillna(df[feature_names].median())
+
+    df["label"] = df["label"].fillna(0).astype(int)
+    df.loc[df["precipitation (mm)"] > 2.0, "label"] = 1
+
+    final_columns = feature_names + ["label"]
+    df_clean = df[final_columns]
+    df_clean.to_pickle(f"{output_dir}/01_ingested_qa_data.pkl")
+
+    print(f"Cleaned Shape: {df_clean.shape}")
+    print(f"Schema Locked. Features: {feature_names}")
+    return df_clean
 
 
-# Initialize the Lightning Trainer
-trainer = pl.Trainer(
-    max_epochs=50,
-    accelerator="auto",
-    devices=1,
-    logger=logger,
-    callbacks=[checkpoint_callback, early_stop_callback],
-    enable_progress_bar=True,
-    log_every_n_steps=10
-)
+def scale_feature_dataframe(df_clean):
+    df_features = df_clean.drop(columns=["label"])
+    train_cutoff = int(len(df_features) * TRAIN_RATIO)
+
+    scaler = StandardScaler()
+    scaler.fit(df_features.iloc[:train_cutoff])
+
+    scaled_data = scaler.transform(df_features)
+    print(f"Data scaled. Scaler fit on first {train_cutoff} rows strictly.")
+    return scaled_data, scaler
 
 
-# In[15]:
+def build_windows(scaled_data):
+    windows = np.lib.stride_tricks.sliding_window_view(
+        scaled_data,
+        window_shape=(WINDOW_SIZE, scaled_data.shape[1]),
+    )
+    windows = windows.squeeze(axis=1)
+    print(f"Windowing complete. Tensor shape: {windows.shape}")
+    return windows
 
 
-print(f"Starting training. Logs and checkpoints will be saved to: {OUTPUT_DIR}")
+def split_windows(windows):
+    n_windows = len(windows)
+    val_start = int(n_windows * TRAIN_RATIO)
+    calib_start = val_start + int(n_windows * VAL_RATIO)
+    test_start = calib_start + int(n_windows * CALIB_RATIO)
 
-# Execute the training loop
-trainer.fit(model, datamodule=data_module)
+    splits = {
+        "train": windows[:val_start],
+        "val": windows[val_start:calib_start],
+        "calib": windows[calib_start:test_start],
+        "test": windows[test_start:],
+    }
 
-print("-" * 50)
-print(f"Training complete.")
-print(f"Best model saved at: {checkpoint_callback.best_model_path}")
+    print(f"X_train shape: {splits['train'].shape}")
+    print(f"X_val shape:   {splits['val'].shape}")
+    print(f"X_calib shape: {splits['calib'].shape}")
+    print(f"X_test shape:  {splits['test'].shape}")
+    return splits
 
 
-# In[16]:
+def save_split_arrays(output_dir, splits):
+    np.save(f"{output_dir}/X_train.npy", splits["train"])
+    np.save(f"{output_dir}/X_val.npy", splits["val"])
+    np.save(f"{output_dir}/X_calib.npy", splits["calib"])
+    np.save(f"{output_dir}/X_test.npy", splits["test"])
 
 
-import torch
-import numpy as np
+def build_data_module(splits):
+    data_module = AtacamaDataModule(
+        x_train=splits["train"],
+        x_val=splits["val"],
+        x_calib=splits["calib"],
+        x_test=splits["test"],
+        batch_size=DATA_BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+    )
+    data_module.setup()
+    sample_batch = next(iter(data_module.train_dataloader()))
+    print(f"Batch shape from train_dataloader: {sample_batch.shape}")
+    return data_module
 
-def get_reconstructions(model, dataloader):
-    """Passes data through the model and returns inputs and reconstructions."""
+
+def build_model(model_name, model_config):
+    model_cls = MODEL_REGISTRY.get(model_name)
+    if model_cls is None:
+        raise ValueError(
+            f"Unknown model_name={model_name!r}. Available: {tuple(MODEL_REGISTRY)}"
+        )
+    model = model_cls(**model_config)
+    print(model)
+    return model
+
+
+def build_trainer(output_dir):
+    logger = CSVLogger(save_dir=output_dir, name="lstm_ae_logs")
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=os.path.join(output_dir, "checkpoints"),
+        filename="best-model-{epoch:02d}-{val_loss:.4f}",
+        save_top_k=1,
+        monitor="val_loss",
+        mode="min",
+    )
+    early_stop_callback = EarlyStopping(
+        monitor="val_loss",
+        patience=5,
+        verbose=True,
+        mode="min",
+    )
+    trainer = pl.Trainer(
+        max_epochs=TRAINER_CONFIG["max_epochs"],
+        accelerator="auto",
+        devices=TRAINER_CONFIG["devices"],
+        logger=logger,
+        callbacks=[checkpoint_callback, early_stop_callback],
+        enable_progress_bar=True,
+        log_every_n_steps=TRAINER_CONFIG["log_every_n_steps"],
+    )
+    return trainer, checkpoint_callback
+
+
+def train_model(model, data_module, output_dir):
+    trainer, checkpoint_callback = build_trainer(output_dir)
+    print(f"Starting training. Logs and checkpoints will be saved to: {output_dir}")
+    trainer.fit(model, datamodule=data_module)
+    print("-" * 50)
+    print("Training complete.")
+    print(f"Best model saved at: {checkpoint_callback.best_model_path}")
+    return checkpoint_callback.best_model_path
+
+
+def load_best_model(model_name, checkpoint_path, device):
+    model_cls = MODEL_REGISTRY[model_name]
+    model = model_cls.load_from_checkpoint(checkpoint_path)
+    model = model.to(device)
     model.eval()
-    # Ensure model is on the correct device (GPU/MPS/CPU)
-    device = next(model.parameters()).device
+    return model
 
-    all_inputs = []
-    all_reconstructions = []
 
+def run_model_inference(model, dataloader, device):
+    outputs = []
     with torch.no_grad():
         for batch in dataloader:
             batch = batch.to(device)
-            reconstruction = model(batch)
-
-            all_inputs.append(batch.cpu().numpy())
-            all_reconstructions.append(reconstruction.cpu().numpy())
-
-    return np.concatenate(all_inputs), np.concatenate(all_reconstructions)
-
-# Load the best model from the checkpoint saved during training
-best_model_path = checkpoint_callback.best_model_path
-model = TimeSeriesAutoencoder.load_from_checkpoint(best_model_path)
-
-# Extract for Calibration and Test sets
-calib_loader = data_module.predict_dataloader() # We mapped Calib here earlier
-test_loader = data_module.test_dataloader()
-
-X_calib_true, X_calib_hat = get_reconstructions(model, calib_loader)
-X_test_true, X_test_hat = get_reconstructions(model, test_loader)
-
-print(f"Calibration Arrays Shape: {X_calib_true.shape}")
-print(f"Test Arrays Shape: {X_test_true.shape}")
-
-
-# In[17]:
+            outputs.append(model(batch).cpu().numpy())
+    return np.concatenate(outputs, axis=0)
 
 
 def calculate_errors(true_data, pred_data):
-    # 1. Raw Squared Error: (Batch, Time, Features)
     squared_error = np.square(true_data - pred_data)
-
-    # 2. Feature-Level MSE: Average across the Time dimension (axis=1)
-    # Output Shape: (Batch, Features)
     feature_mse = np.mean(squared_error, axis=1)
-
-    # 3. Window-Level MSE: Average across both Time and Features (axis=(1,2))
-    # Output Shape: (Batch,)
     window_mse = np.mean(squared_error, axis=(1, 2))
-
     return feature_mse, window_mse
 
-# Calculate for Calibration
-calib_feature_mse, calib_window_mse = calculate_errors(X_calib_true, X_calib_hat)
 
-# Calculate for Test
-test_feature_mse, test_window_mse = calculate_errors(X_test_true, X_test_hat)
+def evaluate_reconstruction_model(model, data_module, splits, device):
+    x_calib_hat = run_model_inference(model, data_module.predict_dataloader(), device)
+    x_test_hat = run_model_inference(model, data_module.test_dataloader(), device)
 
+    calib_feature_mse, calib_window_mse = calculate_errors(splits["calib"], x_calib_hat)
+    test_feature_mse, test_window_mse = calculate_errors(splits["test"], x_test_hat)
 
-# In[18]:
+    window_threshold = np.percentile(calib_window_mse, THRESHOLD_PERCENTILE)
+    feature_thresholds = np.percentile(
+        calib_feature_mse,
+        THRESHOLD_PERCENTILE,
+        axis=0,
+    )
 
+    print(f"Calibration Arrays Shape: {splits['calib'].shape}")
+    print(f"Test Arrays Shape: {splits['test'].shape}")
+    print(
+        f"Global Window Threshold ({THRESHOLD_PERCENTILE}th percentile): "
+        f"{window_threshold:.4f}"
+    )
 
-# Set the threshold using the 99th percentile of the Calibration set
-PERCENTILE = 99
-
-# 1. Window-Level Threshold (A single float value)
-window_threshold = np.percentile(calib_window_mse, PERCENTILE)
-
-# 2. Feature-Level Thresholds (An array of floats, one for each feature)
-feature_thresholds = np.percentile(calib_feature_mse, PERCENTILE, axis=0)
-
-print(f"Global Window Threshold (99th percentile): {window_threshold:.4f}")
-print("Feature-Level Thresholds:")
-for feat, thresh in zip(FEATURES, feature_thresholds):
-    print(f" - {feat}: {thresh:.4f}")
-
-
-# In[19]:
-
-
-import os
-
-# 1. Score the Test Set (Boolean to Integer: True->1, False->0)
-test_window_anomalies = (test_window_mse > window_threshold).astype(int)
-test_feature_anomalies = (test_feature_mse > feature_thresholds).astype(int)
-
-print(f"Total Window Anomalies Found in Test Set: {test_window_anomalies.sum()}")
-
-# 2. Save all evaluation outputs to the unified run directory
-eval_dir = os.path.join(OUTPUT_DIR, "evaluation")
-os.makedirs(eval_dir, exist_ok=True)
-
-# Save Thresholds
-np.save(os.path.join(eval_dir, "window_threshold.npy"), window_threshold)
-np.save(os.path.join(eval_dir, "feature_thresholds.npy"), feature_thresholds)
-
-# Save Test Scores
-np.save(os.path.join(eval_dir, "test_window_mse.npy"), test_window_mse)
-np.save(os.path.join(eval_dir, "test_feature_mse.npy"), test_feature_mse)
-
-# Save Binary Anomaly Flags
-np.save(os.path.join(eval_dir, "test_window_anomalies.npy"), test_window_anomalies)
-np.save(os.path.join(eval_dir, "test_feature_anomalies.npy"), test_feature_anomalies)
-
-print(f"All evaluation outputs and anomaly scores successfully stored in: {eval_dir}")
-
-
-
-
-
-# In[22]:
-
-
-import numpy as np
-
-# Find the indices of all windows flagged as anomalies in the Test set
-anomaly_indices = np.where(test_window_anomalies == 1)[0]
-
-
-# In[23]:
-
-
-import torch
-import numpy as np
-
-# Import cftsad API from installed package or local src fallback.
-try:
-    from cftsad import CFFailure, CFResult, CounterfactualExplainer
-except Exception:
-    from src.cftsad import CFFailure, CFResult, CounterfactualExplainer
-
-
-class AutoencoderPredictorAdapter:
-    """
-    Thin model adapter so cftsad can call the AE with a stable numpy API.
-    """
-
-    def __init__(self, model):
-        self.model = model
-
-    def __call__(self, x_np):
-        x_arr = np.asarray(x_np, dtype=np.float32)
-        self.model.eval()
-        model_device = next(self.model.parameters()).device
-
-        with torch.no_grad():
-            x_tensor = torch.as_tensor(x_arr, dtype=torch.float32, device=model_device)
-            added_batch_dim = False
-            if x_tensor.ndim == 2:
-                x_tensor = x_tensor.unsqueeze(0)
-                added_batch_dim = True
-
-            reconstruction = self.model(x_tensor).detach().cpu().numpy()
-            if added_batch_dim:
-                reconstruction = reconstruction.squeeze(0)
-            return reconstruction
-
-
-def _safe_log_value(v):
-    if isinstance(v, (str, int, float, bool, np.integer, np.floating)):
-        return v
-    return str(v)
-
-
-def build_cftsad_explainers(model_predict_fn, normal_core, threshold):
-    base_kwargs = {
-        "model": model_predict_fn,
-        "normal_core": normal_core,
-        "threshold": float(threshold),
-        "use_constraints_v2": True,
-        "enable_fallback_chain": False,
-        "fallback_retry_budget": 2,
-        "normal_core_threshold_quantile": 0.95,
-        "normal_core_filter_factor": 1.0,
-        "random_seed": 42,
-	"normal_core_max_size":100,
-	"normal_core_use_diversity_sampling": True,
+    return {
+        "x_calib_hat": x_calib_hat,
+        "x_test_hat": x_test_hat,
+        "calib_feature_mse": calib_feature_mse,
+        "calib_window_mse": calib_window_mse,
+        "test_feature_mse": test_feature_mse,
+        "test_window_mse": test_window_mse,
+        "window_threshold": window_threshold,
+        "feature_thresholds": feature_thresholds,
     }
 
-    method_overrides = {
-        "nearest": {
-            "nearest_top_k": 10,
-            "nearest_alpha_steps": 5,
-            "nearest_use_weighted_distance": True,
-            "fallback_methods": ("segment", "motif", "genetic"),
-        },
-        "segment": {
-            "segment_smoothing": True,
-            "segment_n_candidates": 4,
-            "segment_top_k_donors": 8,
-            "segment_context_width": 2,
-            "segment_crossfade_width": 3,
-            "fallback_methods": ("motif", "nearest", "genetic"),
-        },
-        "motif": {
-            "motif_top_k": 5,
-            "motif_n_segments": 2,
-            "motif_length_factors": (0.75, 1.0, 1.25),
-            "motif_context_weight": 0.2,
-            "motif_use_affine_fit": True,
-            "fallback_methods": ("segment", "nearest", "genetic"),
-        },
-        "genetic": {
-            "population_size": 50,
-            "n_generations": 20,
-            "use_plausibility_objective": True,
-            "structured_mutation_weight": 0.35,
-            "top_m_solutions": 5,
-            "early_stop_patience": 15,
-            "fallback_methods": ("segment", "motif", "nearest"),
-        },
+
+def save_evaluation_outputs(output_dir, evaluation, feature_names):
+    eval_dir = os.path.join(output_dir, "evaluation")
+    os.makedirs(eval_dir, exist_ok=True)
+
+    test_window_anomalies = (
+        evaluation["test_window_mse"] > evaluation["window_threshold"]
+    ).astype(int)
+    test_feature_anomalies = (
+        evaluation["test_feature_mse"] > evaluation["feature_thresholds"]
+    ).astype(int)
+
+    np.save(os.path.join(eval_dir, "window_threshold.npy"), evaluation["window_threshold"])
+    np.save(os.path.join(eval_dir, "feature_thresholds.npy"), evaluation["feature_thresholds"])
+    np.save(os.path.join(eval_dir, "test_window_mse.npy"), evaluation["test_window_mse"])
+    np.save(os.path.join(eval_dir, "test_feature_mse.npy"), evaluation["test_feature_mse"])
+    np.save(os.path.join(eval_dir, "test_window_anomalies.npy"), test_window_anomalies)
+    np.save(os.path.join(eval_dir, "test_feature_anomalies.npy"), test_feature_anomalies)
+
+    print("Feature-Level Thresholds:")
+    for feat, thresh in zip(feature_names, evaluation["feature_thresholds"]):
+        print(f" - {feat}: {thresh:.4f}")
+    print(f"Total Window Anomalies Found in Test Set: {test_window_anomalies.sum()}")
+    print(f"All evaluation outputs and anomaly scores successfully stored in: {eval_dir}")
+
+    return eval_dir, test_window_anomalies
+
+
+def _safe_log_value(value):
+    if isinstance(value, (str, int, float, bool, np.integer, np.floating)):
+        return value
+    return str(value)
+
+
+def build_cftsad_explainers(model, normal_core, threshold):
+    base_kwargs = {
+        "model": model,
+        "normal_core": normal_core,
+        "threshold": float(threshold),
+        **CFTSAD_BASE_CONFIG,
     }
 
     explainers = {}
-    for method, overrides in method_overrides.items():
+    for method, overrides in CFTSAD_METHOD_CONFIGS.items():
         explainers[method] = CounterfactualExplainer(
             method=method,
             **base_kwargs,
@@ -741,16 +532,16 @@ def run_counterfactual_benchmark(
             cf_filename = f"cf_{method_name}_window_{idx_to_explain}.npy"
             np.save(os.path.join(cf_arrays_dir, cf_filename), result.x_cf)
             row["cf_array_file"] = cf_filename
-            for k, v in result.meta.items():
-                row[f"meta_{k}"] = _safe_log_value(v)
+            for key, value in result.meta.items():
+                row[f"meta_{key}"] = _safe_log_value(value)
         else:
             print(f"[{method_name}] failed -> {result.reason}")
             row["cf_score"] = np.nan
             row["reason"] = result.reason
             row["message"] = result.message
             row["cf_array_file"] = "N/A"
-            for k, v in result.diagnostics.items():
-                row[f"diag_{k}"] = _safe_log_value(v)
+            for key, value in result.diagnostics.items():
+                row[f"diag_{key}"] = _safe_log_value(value)
 
         rows.append(row)
 
@@ -758,47 +549,80 @@ def run_counterfactual_benchmark(
     if not os.path.exists(csv_path):
         df_log.to_csv(csv_path, index=False)
     else:
-        df_log.to_csv(csv_path, mode='a', header=False, index=False)
+        df_log.to_csv(csv_path, mode="a", header=False, index=False)
 
     print(f"Counterfactual results appended to: {csv_path}")
     return results_by_method
 
 
-if len(anomaly_indices) == 0:
-    raise RuntimeError("No anomalies found in test set for counterfactual generation.")
+def run_counterfactual_pipeline(model, splits, evaluation, eval_dir):
+    anomaly_indices = np.where(
+        evaluation["test_window_mse"] > evaluation["window_threshold"]
+    )[0]
+    if len(anomaly_indices) == 0:
+        raise RuntimeError("No anomalies found in test set for counterfactual generation.")
 
-predict_fn = AutoencoderPredictorAdapter(model)
-explainers = build_cftsad_explainers(
-    model_predict_fn=predict_fn,
-    normal_core=X_calib,
-    threshold=window_threshold,
-)
-
-print(f"Found {len(anomaly_indices)} anomaly windows in test set.")
-print(f"Target threshold: {window_threshold:.4f}")
-print("Explainers initialized:", ", ".join(explainers.keys()))
-
-results_by_index = {}
-for idx in anomaly_indices:
-    idx_to_explain = int(idx)
-    x_anomaly = X_test[idx_to_explain]
-    original_score = float(test_window_mse[idx_to_explain])
-
-    print(f"\nGenerating counterfactuals for Test Window Index: {idx_to_explain}")
-    print(f"Original score: {original_score:.4f}")
-
-    results_by_method = run_counterfactual_benchmark(
-        explainers=explainers,
-        x_anomaly=x_anomaly,
-        idx_to_explain=idx_to_explain,
-        original_score=original_score,
-        threshold=window_threshold,
-        eval_dir=eval_dir,
+    explainers = build_cftsad_explainers(
+        model=model,
+        normal_core=splits["calib"],
+        threshold=evaluation["window_threshold"],
     )
-    results_by_index[idx_to_explain] = results_by_method
+
+    print(f"Found {len(anomaly_indices)} anomaly windows in test set.")
+    print(f"Target threshold: {evaluation['window_threshold']:.4f}")
+    print("Explainers initialized:", ", ".join(explainers.keys()))
+
+    results_by_index = {}
+    for idx in anomaly_indices:
+        idx_to_explain = int(idx)
+        x_anomaly = splits["test"][idx_to_explain]
+        original_score = float(evaluation["test_window_mse"][idx_to_explain])
+
+        print(f"\nGenerating counterfactuals for Test Window Index: {idx_to_explain}")
+        print(f"Original score: {original_score:.4f}")
+
+        results_by_method = run_counterfactual_benchmark(
+            explainers=explainers,
+            x_anomaly=x_anomaly,
+            idx_to_explain=idx_to_explain,
+            original_score=original_score,
+            threshold=evaluation["window_threshold"],
+            eval_dir=eval_dir,
+        )
+        results_by_index[idx_to_explain] = results_by_method
+
+    return results_by_index
 
 
-# In[ ]:
+def main():
+    device = configure_runtime()
+    output_dir = make_output_dir()
+    print(f"Results for this session will be stored in: {output_dir}")
+
+    feature_names = load_feature_names(VAR_LIST_PATH)
+    df_clean = load_and_clean_dataframe(DATA_PATH, feature_names, output_dir)
+    scaled_data, _ = scale_feature_dataframe(df_clean)
+    windows = build_windows(scaled_data)
+    splits = split_windows(windows)
+    save_split_arrays(output_dir, splits)
+
+    data_module = build_data_module(splits)
+    model = build_model(MODEL_NAME, MODEL_CONFIG)
+    best_model_path = train_model(model, data_module, output_dir)
+    best_model = load_best_model(MODEL_NAME, best_model_path, device)
+
+    evaluation = evaluate_reconstruction_model(best_model, data_module, splits, device)
+    eval_dir, _ = save_evaluation_outputs(output_dir, evaluation, feature_names)
+    results_by_index = run_counterfactual_pipeline(
+        best_model,
+        splits,
+        evaluation,
+        eval_dir,
+    )
+
+    return results_by_index
 
 
-results_by_index
+if __name__ == "__main__":
+    results_by_index = main()
+    print(results_by_index)

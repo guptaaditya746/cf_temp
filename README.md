@@ -20,6 +20,18 @@ Editable dev install:
 pip install -e .
 ```
 
+## Branch Workflow
+
+Active development now happens on the `genetic` branch.
+
+```bash
+git switch genetic
+git pull
+git push -u origin genetic
+```
+
+`main` is kept as the stable/reference branch until the remote default branch is changed.
+
 ## Quick Start
 
 ```python
@@ -35,6 +47,7 @@ explainer = CounterfactualExplainer(
     model=model,
     normal_core=core,
     threshold=None,
+    score_fn=None,  # optional custom scoring function
     population_size=100,
     n_generations=50,
 )
@@ -128,6 +141,7 @@ CounterfactualExplainer(
     model=model,
     normal_core=core,
     threshold=None,
+    score_fn=None,                 # optional custom scoring function
     immutable_features=(0,),        # optional
     bounds={1: (-3.0, 3.0)},        # optional
     random_seed=42,                 # optional
@@ -140,6 +154,7 @@ CounterfactualExplainer(
 - `model`
 - `normal_core`
 - `threshold`: if `None`, estimated from normal core
+- `score_fn`: optional callable override for anomaly scoring during threshold/core building
 - `immutable_features`
 - `bounds`
 - `random_seed`
