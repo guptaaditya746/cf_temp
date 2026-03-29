@@ -124,5 +124,9 @@ ANOMALY_REPAIR_CONFIG = {
     "interval_quantile": 0.9,
     "min_interval_length": 2,
     "enforce_psd": True,
+    "fallback_top_k": 8,
+    "fallback_alpha_steps": 9,
+    "context_width": 2,
+    "crossfade_width": 2,
     "random_seed": 42,
 }

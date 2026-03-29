@@ -88,6 +88,7 @@ def build_cftsad_explainers(model, normal_core, threshold, score_fn):
         model=model,
         threshold=float(threshold),
         score_fn=score_fn,
+        normal_core=normal_core,
         **ANOMALY_REPAIR_CONFIG,
     )
     return explainers

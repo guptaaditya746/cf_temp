@@ -15,6 +15,26 @@ def _stabilize_covariance(cov, min_eig=1e-8):
     return (eigvecs * eigvals[None, :]) @ eigvecs.T
 
 
+def _crossfade_boundaries(x_cf, x_original, start, end, width=2):
+    out = np.array(x_cf, copy=True)
+    w = max(0, int(width))
+    if w == 0:
+        return out
+
+    for i in range(1, w + 1):
+        li = start - i
+        if li >= 0:
+            alpha = float(i) / float(w + 1)
+            out[li] = (1.0 - alpha) * x_original[li] + alpha * out[li]
+
+        ri = end + i - 1
+        if ri < out.shape[0]:
+            alpha = float(i) / float(w + 1)
+            out[ri] = (1.0 - alpha) * x_original[ri] + alpha * out[ri]
+
+    return out
+
+
 def sample_replacement(X, intvl, td=1, cond=None, enforce_psd=True):
     """ Samples a replacement for a given interval, taking inter-variable and inter-temporal correlations into account.
 
@@ -204,11 +224,16 @@ class AnomalyRepairExplainer:
         threshold,
         *,
         score_fn,
+        normal_core=None,
         td=2,
         n_samples=25,
         interval_quantile=0.9,
         min_interval_length=2,
         enforce_psd=True,
+        fallback_top_k=8,
+        fallback_alpha_steps=9,
+        context_width=2,
+        crossfade_width=2,
         random_seed=42,
     ):
         self.model = model
@@ -216,11 +241,18 @@ class AnomalyRepairExplainer:
         if not callable(score_fn):
             raise ValueError("anomaly_repair requires a callable score_fn")
         self.score_fn = score_fn
+        self.normal_core = (
+            None if normal_core is None else np.asarray(normal_core, dtype=np.float64)
+        )
         self.td = int(td)
         self.n_samples = int(n_samples)
         self.interval_quantile = float(interval_quantile)
         self.min_interval_length = int(min_interval_length)
         self.enforce_psd = bool(enforce_psd)
+        self.fallback_top_k = int(fallback_top_k)
+        self.fallback_alpha_steps = int(fallback_alpha_steps)
+        self.context_width = int(context_width)
+        self.crossfade_width = int(crossfade_width)
         self.rng = np.random.default_rng(random_seed)
         self._current_interval = None
 
@@ -238,6 +270,91 @@ class AnomalyRepairExplainer:
 
     def _score(self, x):
         return float(self.score_fn(np.asarray(x, dtype=np.float64)))
+
+    def _context_distance(self, x, donor, start, end):
+        left_start = max(0, start - self.context_width)
+        left_end = start
+        right_start = end
+        right_end = min(x.shape[0], end + self.context_width)
+
+        parts = []
+        if left_end > left_start:
+            parts.append(np.mean((x[left_start:left_end] - donor[left_start:left_end]) ** 2))
+        if right_end > right_start:
+            parts.append(np.mean((x[right_start:right_end] - donor[right_start:right_end]) ** 2))
+
+        if parts:
+            return float(np.mean(parts))
+        return float(np.mean((x - donor) ** 2))
+
+    def _try_donor_guided_repair(self, x_arr, score_before, start, end):
+        if self.normal_core is None or self.normal_core.ndim != 3 or self.normal_core.shape[0] == 0:
+            return None
+
+        donor_indices = []
+        donor_pool = []
+        donor_dists = []
+        for donor_idx, donor in enumerate(self.normal_core):
+            if donor.shape != x_arr.shape:
+                continue
+            donor_indices.append(int(donor_idx))
+            donor_pool.append(donor)
+            donor_dists.append(self._context_distance(x_arr, donor, start, end))
+
+        donor_pool = np.asarray(donor_pool, dtype=np.float64)
+        donor_dists = np.asarray(donor_dists, dtype=np.float64)
+        if donor_pool.shape[0] == 0 or donor_dists.size == 0:
+            return None
+
+        k = max(1, min(self.fallback_top_k, int(donor_pool.shape[0])))
+        top_idx = np.argpartition(donor_dists, k - 1)[:k]
+        top_idx = top_idx[np.argsort(donor_dists[top_idx])]
+        alphas = np.linspace(1.0, 0.25, max(2, self.fallback_alpha_steps))
+
+        best_candidate = None
+        best_score = np.inf
+        best_meta = None
+
+        for donor_idx in top_idx:
+            donor = donor_pool[int(donor_idx)]
+            donor_slice = donor[start:end, :]
+            for alpha in alphas:
+                candidate = np.array(x_arr, copy=True)
+                candidate[start:end, :] = (
+                    (1.0 - float(alpha)) * x_arr[start:end, :]
+                    + float(alpha) * donor_slice
+                )
+                candidate = _crossfade_boundaries(
+                    candidate,
+                    x_arr,
+                    start=start,
+                    end=end,
+                    width=self.crossfade_width,
+                )
+
+                score = self._score(candidate)
+                meta = {
+                    "method": "anomaly_repair",
+                    "repair_strategy": "donor_guided",
+                    "interval": (int(start), int(end)),
+                    "interval_source": "shared_model_localizer",
+                    "score_before": float(score_before),
+                    "score_source": "external_score_fn",
+                    "shared_interval_quantile": float(self.interval_quantile),
+                    "donor_idx": int(donor_indices[int(donor_idx)]),
+                    "donor_context_distance": float(donor_dists[int(donor_idx)]),
+                    "alpha": float(alpha),
+                    "fallback_top_k": int(self.fallback_top_k),
+                    "fallback_alpha_steps": int(self.fallback_alpha_steps),
+                }
+                if score < best_score:
+                    best_candidate = candidate
+                    best_score = score
+                    best_meta = meta
+                if score <= self.threshold:
+                    return CFResult(x_cf=candidate, score_cf=float(score), meta=meta)
+
+        return best_candidate, best_score, best_meta
 
     def explain(self, x):
         x_arr = np.asarray(x, dtype=np.float64)
@@ -277,6 +394,8 @@ class AnomalyRepairExplainer:
         original_state = np.random.get_state()
         best_candidate = None
         best_score = np.inf
+        best_meta = None
+        gaussian_error = None
         try:
             for _ in range(self.n_samples):
                 np.random.seed(int(self.rng.integers(0, 2**31 - 1)))
@@ -293,9 +412,9 @@ class AnomalyRepairExplainer:
                 if score < best_score:
                     best_candidate = candidate
                     best_score = score
-                if score <= self.threshold:
-                    meta = {
+                    best_meta = {
                         "method": "anomaly_repair",
+                        "repair_strategy": "gaussian",
                         "interval": (int(start), int(end)),
                         "interval_source": "shared_model_localizer",
                         "score_before": float(score_before),
@@ -303,15 +422,33 @@ class AnomalyRepairExplainer:
                         "repair_samples": int(self.n_samples),
                         "shared_interval_quantile": float(self.interval_quantile),
                     }
-                    return CFResult(x_cf=candidate, score_cf=float(score), meta=meta)
+                if score <= self.threshold:
+                    return CFResult(
+                        x_cf=candidate,
+                        score_cf=float(score),
+                        meta=dict(best_meta),
+                    )
         except Exception as exc:
-            return CFFailure(
-                reason="repair_failed",
-                message=str(exc),
-                diagnostics={"interval": (int(start), int(end))},
-            )
+            gaussian_error = str(exc)
         finally:
             np.random.set_state(original_state)
+
+        donor_result = self._try_donor_guided_repair(x_arr, score_before, start, end)
+        if isinstance(donor_result, CFResult):
+            return donor_result
+        if donor_result is not None:
+            donor_candidate, donor_score, donor_meta = donor_result
+            if donor_score < best_score:
+                best_candidate = donor_candidate
+                best_score = donor_score
+                best_meta = donor_meta
+
+        if gaussian_error is not None and best_candidate is None:
+            return CFFailure(
+                reason="repair_failed",
+                message=gaussian_error,
+                diagnostics={"interval": (int(start), int(end))},
+            )
 
         return CFFailure(
             reason="no_valid_cf",
@@ -321,5 +458,7 @@ class AnomalyRepairExplainer:
                 "best_score": float(best_score) if np.isfinite(best_score) else None,
                 "interval": (int(start), int(end)),
                 "best_candidate_found": best_candidate is not None,
+                "best_repair_strategy": None if best_meta is None else best_meta["repair_strategy"],
+                "gaussian_error": gaussian_error,
             },
         )
