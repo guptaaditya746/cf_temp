@@ -5,7 +5,7 @@ import pandas as pd
 
 from configs.defaults import ANOMALY_REPAIR_CONFIG, CFTSAD_BASE_CONFIG, CFTSAD_METHOD_CONFIGS
 from counterfactual_methods.anomaly_repair import AnomalyRepairExplainer
-from utils.scoring import build_score_fn
+from evaluation.reconstruction import build_score_fn
 
 from cftsad import CFFailure, CFResult, CounterfactualExplainer
 
