@@ -32,6 +32,63 @@ git push -u origin genetic
 
 `main` is kept as the stable/reference branch until the remote default branch is changed.
 
+## Running the Pipeline
+
+The repo now supports a staged pipeline layout:
+
+- `preprocessing.py`
+- `training.py`
+- `evaluation_model.py`
+- `generating_counterfactual.py`
+- `evaluation_counterfactual.py`
+
+Main settings live in [configs/defaults.py](/home/gupt_ad/part_2_local/push_repos_only/cf_temp/configs/defaults.py).
+
+### Prerequisites
+
+Install the runtime dependencies used by the pipeline example:
+
+```bash
+pip install -e .
+pip install torch pytorch-lightning pandas scikit-learn matplotlib seaborn
+```
+
+### End-to-End Run
+
+Run the full pipeline step by step using one shared run directory.
+
+```bash
+python preprocessing.py
+python training.py --run-dir results/run_YYYYMMDD-HHMMSS
+python evaluation_model.py --run-dir results/run_YYYYMMDD-HHMMSS
+python generating_counterfactual.py --run-dir results/run_YYYYMMDD-HHMMSS
+python evaluation_counterfactual.py --run-dir results/run_YYYYMMDD-HHMMSS
+```
+
+The first command creates a new run directory under `results/`. Use that same path for all later stages.
+
+### Single-Script Run
+
+To run the complete flow in one go:
+
+```bash
+python example.py
+```
+
+### Stage Outputs
+
+- preprocessing writes `X_train.npy`, `X_val.npy`, `X_calib.npy`, `X_test.npy`
+- training writes checkpoints and `training_metadata.json`
+- model evaluation writes files under `results/.../evaluation/`
+- counterfactual generation writes `counterfactual_log.csv` and `cf_arrays/`
+- counterfactual evaluation writes `counterfactual_summary.csv`
+
+### Customization
+
+- change dataset paths, split ratios, model choice, and method defaults in [configs/defaults.py](/home/gupt_ad/part_2_local/push_repos_only/cf_temp/configs/defaults.py)
+- add new black-box models in [models/autoencoder.py](/home/gupt_ad/part_2_local/push_repos_only/cf_temp/models/autoencoder.py) or another file under `models/`, then register them in `MODEL_REGISTRY`
+- add new counterfactual pipelines under [counterfactual_methods/pipeline.py](/home/gupt_ad/part_2_local/push_repos_only/cf_temp/counterfactual_methods/pipeline.py)
+
 ## Quick Start
 
 ```python
