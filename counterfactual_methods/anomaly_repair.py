@@ -2,8 +2,8 @@ import numpy as np
 from scipy.stats import multivariate_normal as mvn
 
 
+from cftsad.core.localization import compute_localization_errors
 from cftsad.core.postprocess import build_explainability_meta, build_score_summary
-from cftsad.core.scoring import reconstruction_errors_per_timestep
 from cftsad.types import CFFailure, CFResult
 
 
@@ -36,10 +36,22 @@ def _crossfade_boundaries(x_cf, x_original, start, end, width=2):
     return out
 
 
-def _interval_summary(start, end, window_length, errors):
-    interval_errors = np.asarray(errors[start:end], dtype=np.float64)
-    top_k = min(5, len(errors))
-    top_idx = np.argsort(-np.asarray(errors, dtype=np.float64))[:top_k]
+def _interval_summary(
+    start,
+    end,
+    window_length,
+    localizer_errors,
+    raw_errors,
+    *,
+    normalize_errors=False,
+    reference=None,
+):
+    localizer_errors = np.asarray(localizer_errors, dtype=np.float64)
+    raw_errors = np.asarray(raw_errors, dtype=np.float64)
+    interval_errors = np.asarray(localizer_errors[start:end], dtype=np.float64)
+    interval_raw_errors = np.asarray(raw_errors[start:end], dtype=np.float64)
+    top_k = min(5, len(localizer_errors))
+    top_idx = np.argsort(-localizer_errors)[:top_k]
     return {
         "interval_start": int(start),
         "interval_end": int(end),
@@ -47,15 +59,36 @@ def _interval_summary(start, end, window_length, errors):
         "interval_fraction": float((end - start) / max(1, window_length)),
         "touches_left_boundary": bool(start == 0),
         "touches_right_boundary": bool(end == window_length),
-        "peak_error_timestep": int(np.argmax(errors)),
-        "peak_error_value": float(np.max(errors)),
+        "peak_error_timestep": int(np.argmax(localizer_errors)),
+        "peak_error_value": float(np.max(localizer_errors)),
+        "peak_raw_error_timestep": int(np.argmax(raw_errors)),
+        "peak_raw_error_value": float(np.max(raw_errors)),
         "interval_mean_error": (
             None if interval_errors.size == 0 else float(np.mean(interval_errors))
         ),
         "interval_max_error": (
             None if interval_errors.size == 0 else float(np.max(interval_errors))
         ),
+        "interval_mean_raw_error": (
+            None if interval_raw_errors.size == 0 else float(np.mean(interval_raw_errors))
+        ),
+        "interval_max_raw_error": (
+            None if interval_raw_errors.size == 0 else float(np.max(interval_raw_errors))
+        ),
         "top_error_timesteps": [int(i) for i in top_idx.tolist()],
+        "normalize_errors_used": bool(normalize_errors),
+        "calibration_error_reference": (
+            None
+            if reference is None
+            else {
+                "mean_min": float(np.min(reference["mean"])),
+                "mean_median": float(np.median(reference["mean"])),
+                "mean_max": float(np.max(reference["mean"])),
+                "std_min": float(np.min(reference["std"])),
+                "std_median": float(np.median(reference["std"])),
+                "std_max": float(np.max(reference["std"])),
+            }
+        ),
     }
 
 
@@ -210,13 +243,25 @@ def conditional_mvn(mu, S, X, d_obs):
     return mu_cond, S_cond
 
 
-def detect_anomalous_interval(x, model, quantile=0.9, min_length=1):
-    errors = reconstruction_errors_per_timestep(model, x)
+def detect_anomalous_interval(
+    x,
+    model,
+    normal_core=None,
+    quantile=0.9,
+    min_length=1,
+    normalize_errors=True,
+):
+    errors, raw_errors, reference = compute_localization_errors(
+        model,
+        x,
+        normal_core=normal_core,
+        normalize=normalize_errors,
+    )
     cutoff = float(np.quantile(errors, quantile))
     flagged = np.flatnonzero(errors >= cutoff)
     if flagged.size == 0:
         peak_idx = int(np.argmax(errors))
-        return peak_idx, min(peak_idx + 1, x.shape[0]), errors
+        return peak_idx, min(peak_idx + 1, x.shape[0]), errors, raw_errors, reference
 
     runs = []
     start = int(flagged[0])
@@ -238,7 +283,7 @@ def detect_anomalous_interval(x, model, quantile=0.9, min_length=1):
         best_start = max(0, center - half)
         best_end = min(x.shape[0], best_start + min_length)
         best_start = max(0, best_end - min_length)
-    return int(best_start), int(best_end), errors
+    return int(best_start), int(best_end), errors, raw_errors, reference
 
 
 class AnomalyRepairExplainer:
@@ -258,6 +303,7 @@ class AnomalyRepairExplainer:
         fallback_alpha_steps=9,
         context_width=2,
         crossfade_width=2,
+        normalize_errors=True,
         random_seed=42,
     ):
         self.model = model
@@ -277,6 +323,7 @@ class AnomalyRepairExplainer:
         self.fallback_alpha_steps = int(fallback_alpha_steps)
         self.context_width = int(context_width)
         self.crossfade_width = int(crossfade_width)
+        self.normalize_errors = bool(normalize_errors)
         self.rng = np.random.default_rng(random_seed)
         self._current_interval = None
 
@@ -401,7 +448,12 @@ class AnomalyRepairExplainer:
             )
 
         score_before = self._score(x_arr)
-        errors = reconstruction_errors_per_timestep(self.model, x_arr)
+        localizer_errors, raw_errors, reference = compute_localization_errors(
+            self.model,
+            x_arr,
+            normal_core=self.normal_core,
+            normalize=self.normalize_errors,
+        )
         if score_before <= self.threshold:
             return CFFailure(
                 reason="already_valid",
@@ -426,7 +478,15 @@ class AnomalyRepairExplainer:
                     "window_length": int(x_arr.shape[0]),
                 },
             )
-        interval_meta = _interval_summary(start, end, x_arr.shape[0], errors)
+        interval_meta = _interval_summary(
+            start,
+            end,
+            x_arr.shape[0],
+            localizer_errors,
+            raw_errors,
+            normalize_errors=self.normalize_errors,
+            reference=reference,
+        )
 
         original_state = np.random.get_state()
         best_candidate = None

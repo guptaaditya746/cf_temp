@@ -178,11 +178,13 @@ def run_counterfactual_pipeline(model, splits, evaluation, eval_dir):
         print(f"Original score: {original_score:.4f}")
 
         if anomaly_repair is not None:
-            shared_start, shared_end, _ = detect_anomalous_interval(
+            shared_start, shared_end, _, _, _ = detect_anomalous_interval(
                 x_anomaly,
                 model,
+                normal_core=getattr(anomaly_repair, "normal_core", None),
                 quantile=float(getattr(anomaly_repair, "interval_quantile", 0.9)),
                 min_length=int(getattr(anomaly_repair, "min_interval_length", 1)),
+                normalize_errors=bool(getattr(anomaly_repair, "normalize_errors", True)),
             )
             anomaly_repair.set_interval((shared_start, shared_end))
             print(f"Shared interval for this window: [{shared_start}, {shared_end})")
