@@ -8,7 +8,11 @@ import numpy as np
 from cftsad.core.candidates import compute_candidate_metrics, rank_candidates
 from cftsad.core.constraints import apply_constraints
 from cftsad.core.constraints_v2 import apply_constraints_v2
-from cftsad.core.postprocess import build_explainability_meta
+from cftsad.core.postprocess import (
+    build_candidate_summary,
+    build_explainability_meta,
+    build_score_summary,
+)
 from cftsad.core.scoring import reconstruction_score
 from cftsad.methods.segment import detect_candidate_segments
 from cftsad.types import CFFailure, CFResult
@@ -126,6 +130,7 @@ def generate_motif(
     motif_lengths = set()
     best_constraint_violation = np.inf
     best_constraint_breakdown = None
+    motif_search_summary = []
 
     for start, end in segment_candidates:
         motif_length = end - start + 1
@@ -139,6 +144,24 @@ def generate_motif(
         k = max(1, min(int(top_k), shape_dist.shape[0]))
         top_idx = np.argpartition(shape_dist, k - 1)[:k]
         top_idx = top_idx[np.argsort(shape_dist[top_idx])]
+        motif_search_summary.append(
+            {
+                "segment_start": int(start),
+                "segment_end": int(end),
+                "motif_length": int(motif_length),
+                "touches_left_boundary": bool(start == 0),
+                "touches_right_boundary": bool(end == x.shape[0] - 1),
+                "n_available_motifs": int(shape_dist.shape[0]),
+                "top_matches": [
+                    {
+                        "donor_idx": int(sources[int(idx)][0]),
+                        "donor_start": int(sources[int(idx)][1]),
+                        "shape_distance": float(shape_dist[int(idx)]),
+                    }
+                    for idx in top_idx[: min(3, len(top_idx))].tolist()
+                ],
+            }
+        )
 
         for idx in top_idx:
             attempted += 1
@@ -201,9 +224,18 @@ def generate_motif(
             all_candidates.append(cand)
 
     ranked = rank_candidates(all_candidates, threshold=thr)
+    best = ranked[0] if ranked else None
     runtime_ms = (time.perf_counter() - t0) * 1000.0
-    if ranked and ranked[0].score_cf <= thr:
-        best = ranked[0]
+    common_meta = {
+        "segment_candidates": motif_search_summary,
+        "motif_lengths_considered": sorted(int(v) for v in motif_lengths),
+        "n_segments_considered": int(len(segment_candidates)),
+        "n_candidates_evaluated": int(attempted),
+        "best_candidate_summary": build_candidate_summary(x, best, threshold=thr),
+        "runtime_ms": runtime_ms,
+        "score_source": "custom" if score_fn is not None else "reconstruction_score",
+    }
+    if best is not None and best.score_cf <= thr:
         meta = {
             "motif_length": int(best.diagnostics["motif_length"]),
             "segment_start": int(best.diagnostics["segment_start"]),
@@ -218,15 +250,11 @@ def generate_motif(
             "motif_rank_score": float(best.diagnostics["motif_rank_score"]),
             "affine_a": float(best.diagnostics["affine_a"]),
             "affine_b": float(best.diagnostics["affine_b"]),
-            "score_before": score_before,
-            "score_after": float(best.score_cf),
-            "n_segments_considered": int(len(segment_candidates)),
-            "n_candidates_evaluated": int(attempted),
             "constraint_violation": float(best.diagnostics["constraint_violation"]),
             "constraint_breakdown": best.diagnostics["constraint_breakdown"],
-            "runtime_ms": runtime_ms,
-            "score_source": "custom" if score_fn is not None else "reconstruction_score",
         }
+        meta.update(build_score_summary(score_before, float(best.score_cf), thr))
+        meta.update(common_meta)
         meta.update(build_explainability_meta(x, best.x_cf))
         return CFResult(x_cf=best.x_cf, score_cf=float(best.score_cf), meta=meta)
 
@@ -234,17 +262,15 @@ def generate_motif(
         reason="no_valid_cf",
         message="Motif search did not produce a valid counterfactual.",
         diagnostics={
-            "score_before": score_before,
-            "best_score_after": float(ranked[0].score_cf) if ranked else None,
-            "threshold": thr,
-            "motif_lengths_considered": sorted(int(v) for v in motif_lengths),
-            "n_segments_considered": int(len(segment_candidates)),
-            "n_candidates_evaluated": int(attempted),
+            **build_score_summary(
+                score_before,
+                None if best is None else float(best.score_cf),
+                thr,
+            ),
+            **common_meta,
             "best_constraint_violation": (
                 None if not np.isfinite(best_constraint_violation) else float(best_constraint_violation)
             ),
             "best_constraint_breakdown": best_constraint_breakdown,
-            "runtime_ms": runtime_ms,
-            "score_source": "custom" if score_fn is not None else "reconstruction_score",
         },
     )

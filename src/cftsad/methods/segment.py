@@ -8,7 +8,11 @@ import numpy as np
 from cftsad.core.candidates import compute_candidate_metrics, rank_candidates
 from cftsad.core.constraints import apply_constraints
 from cftsad.core.constraints_v2 import apply_constraints_v2
-from cftsad.core.postprocess import build_explainability_meta
+from cftsad.core.postprocess import (
+    build_candidate_summary,
+    build_explainability_meta,
+    build_score_summary,
+)
 from cftsad.core.distances import window_mse_distance
 from cftsad.core.scoring import reconstruction_errors_per_timestep, reconstruction_score
 from cftsad.types import CFFailure, CFResult
@@ -164,6 +168,7 @@ def generate_segment(
     t0 = time.perf_counter()
     score_before = _score_candidate(model, x, score_fn)
     thr = float(threshold)
+    errors = reconstruction_errors_per_timestep(model, x)
 
     segments = detect_candidate_segments(model, x, n_segments=n_segments)
     if not segments:
@@ -177,6 +182,7 @@ def generate_segment(
     attempted = 0
     best_constraint_violation = np.inf
     best_constraint_breakdown = None
+    segment_search_summary = []
 
     for start, end in segments:
         c0 = max(0, start - int(context_width))
@@ -189,6 +195,28 @@ def generate_segment(
         k = max(1, min(int(top_k_donors), int(donor_dists.shape[0])))
         top_idx = np.argpartition(donor_dists, k - 1)[:k]
         top_idx = top_idx[np.argsort(donor_dists[top_idx])]
+        segment_search_summary.append(
+            {
+                "segment_start": int(start),
+                "segment_end": int(end),
+                "segment_length": int(end - start + 1),
+                "touches_left_boundary": bool(start == 0),
+                "touches_right_boundary": bool(end == x.shape[0] - 1),
+                "context_start": int(c0),
+                "context_end": int(c1),
+                "segment_mean_error": float(np.mean(errors[start : end + 1])),
+                "segment_max_error": float(np.max(errors[start : end + 1])),
+                "best_donor_distance": float(np.min(donor_dists)),
+                "median_donor_distance": float(np.median(donor_dists)),
+                "top_donors": [
+                    {
+                        "donor_idx": int(donor_idx),
+                        "distance": float(donor_dists[int(donor_idx)]),
+                    }
+                    for donor_idx in top_idx[: min(3, len(top_idx))].tolist()
+                ],
+            }
+        )
 
         for donor_idx in top_idx:
             attempted += 1
@@ -237,9 +265,20 @@ def generate_segment(
             candidates.append(cand)
 
     ranked = rank_candidates(candidates, threshold=thr)
+    best = ranked[0] if ranked else None
     runtime_ms = (time.perf_counter() - t0) * 1000.0
-    if ranked and ranked[0].score_cf <= thr:
-        best = ranked[0]
+    common_meta = {
+        "segment_candidates": segment_search_summary,
+        "localizer_peak_timestep": int(np.argmax(errors)),
+        "localizer_peak_error": float(np.max(errors)),
+        "smoothing_used": bool(smoothing),
+        "n_segments_considered": int(len(segments)),
+        "n_candidates_evaluated": int(attempted),
+        "best_candidate_summary": build_candidate_summary(x, best, threshold=thr),
+        "runtime_ms": runtime_ms,
+        "score_source": "custom" if score_fn is not None else "reconstruction_score",
+    }
+    if best is not None and best.score_cf <= thr:
         meta = {
             "segment_start": int(best.diagnostics["segment_start"]),
             "segment_end": int(best.diagnostics["segment_end"]),
@@ -247,16 +286,11 @@ def generate_segment(
             "context_end": int(best.diagnostics["context_end"]),
             "donor_idx": int(best.diagnostics["donor_idx"]),
             "segment_distance": float(best.diagnostics["segment_distance"]),
-            "score_before": score_before,
-            "score_after": float(best.score_cf),
-            "smoothing_used": bool(smoothing),
-            "n_segments_considered": int(len(segments)),
-            "n_candidates_evaluated": int(attempted),
             "constraint_violation": float(best.diagnostics["constraint_violation"]),
             "constraint_breakdown": best.diagnostics["constraint_breakdown"],
-            "runtime_ms": runtime_ms,
-            "score_source": "custom" if score_fn is not None else "reconstruction_score",
         }
+        meta.update(build_score_summary(score_before, float(best.score_cf), thr))
+        meta.update(common_meta)
         meta.update(build_explainability_meta(x, best.x_cf))
         return CFResult(x_cf=best.x_cf, score_cf=float(best.score_cf), meta=meta)
 
@@ -264,17 +298,15 @@ def generate_segment(
         reason="no_valid_cf",
         message="Segment substitution candidate did not satisfy threshold.",
         diagnostics={
-            "score_before": score_before,
-            "best_score_after": float(ranked[0].score_cf) if ranked else None,
-            "threshold": thr,
-            "smoothing_used": bool(smoothing),
-            "n_segments_considered": int(len(segments)),
-            "n_candidates_evaluated": int(attempted),
+            **build_score_summary(
+                score_before,
+                None if best is None else float(best.score_cf),
+                thr,
+            ),
+            **common_meta,
             "best_constraint_violation": (
                 None if not np.isfinite(best_constraint_violation) else float(best_constraint_violation)
             ),
             "best_constraint_breakdown": best_constraint_breakdown,
-            "runtime_ms": runtime_ms,
-            "score_source": "custom" if score_fn is not None else "reconstruction_score",
         },
     )

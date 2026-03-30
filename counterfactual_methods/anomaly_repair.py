@@ -2,6 +2,7 @@ import numpy as np
 from scipy.stats import multivariate_normal as mvn
 
 
+from cftsad.core.postprocess import build_explainability_meta, build_score_summary
 from cftsad.core.scoring import reconstruction_errors_per_timestep
 from cftsad.types import CFFailure, CFResult
 
@@ -33,6 +34,29 @@ def _crossfade_boundaries(x_cf, x_original, start, end, width=2):
             out[ri] = (1.0 - alpha) * x_original[ri] + alpha * out[ri]
 
     return out
+
+
+def _interval_summary(start, end, window_length, errors):
+    interval_errors = np.asarray(errors[start:end], dtype=np.float64)
+    top_k = min(5, len(errors))
+    top_idx = np.argsort(-np.asarray(errors, dtype=np.float64))[:top_k]
+    return {
+        "interval_start": int(start),
+        "interval_end": int(end),
+        "interval_length": int(end - start),
+        "interval_fraction": float((end - start) / max(1, window_length)),
+        "touches_left_boundary": bool(start == 0),
+        "touches_right_boundary": bool(end == window_length),
+        "peak_error_timestep": int(np.argmax(errors)),
+        "peak_error_value": float(np.max(errors)),
+        "interval_mean_error": (
+            None if interval_errors.size == 0 else float(np.mean(interval_errors))
+        ),
+        "interval_max_error": (
+            None if interval_errors.size == 0 else float(np.max(interval_errors))
+        ),
+        "top_error_timesteps": [int(i) for i in top_idx.tolist()],
+    }
 
 
 def sample_replacement(X, intvl, td=1, cond=None, enforce_psd=True):
@@ -287,7 +311,7 @@ class AnomalyRepairExplainer:
             return float(np.mean(parts))
         return float(np.mean((x - donor) ** 2))
 
-    def _try_donor_guided_repair(self, x_arr, score_before, start, end):
+    def _try_donor_guided_repair(self, x_arr, score_before, start, end, interval_meta):
         if self.normal_core is None or self.normal_core.ndim != 3 or self.normal_core.shape[0] == 0:
             return None
 
@@ -310,6 +334,13 @@ class AnomalyRepairExplainer:
         top_idx = np.argpartition(donor_dists, k - 1)[:k]
         top_idx = top_idx[np.argsort(donor_dists[top_idx])]
         alphas = np.linspace(1.0, 0.25, max(2, self.fallback_alpha_steps))
+        shortlist_donors = [
+            {
+                "donor_idx": int(donor_indices[int(idx)]),
+                "context_distance": float(donor_dists[int(idx)]),
+            }
+            for idx in top_idx[: min(5, len(top_idx))].tolist()
+        ]
 
         best_candidate = None
         best_score = np.inf
@@ -346,7 +377,11 @@ class AnomalyRepairExplainer:
                     "alpha": float(alpha),
                     "fallback_top_k": int(self.fallback_top_k),
                     "fallback_alpha_steps": int(self.fallback_alpha_steps),
+                    "donor_shortlist": shortlist_donors,
+                    "n_attempts": int(len(top_idx) * len(alphas)),
                 }
+                meta.update(build_score_summary(score_before, score, self.threshold))
+                meta.update(interval_meta)
                 if score < best_score:
                     best_candidate = candidate
                     best_score = score
@@ -366,11 +401,12 @@ class AnomalyRepairExplainer:
             )
 
         score_before = self._score(x_arr)
+        errors = reconstruction_errors_per_timestep(self.model, x_arr)
         if score_before <= self.threshold:
             return CFFailure(
                 reason="already_valid",
                 message="input is already below the anomaly threshold",
-                diagnostics={"score_before": float(score_before)},
+                diagnostics=build_score_summary(score_before, score_before, self.threshold),
             )
 
         if self._current_interval is None:
@@ -390,12 +426,14 @@ class AnomalyRepairExplainer:
                     "window_length": int(x_arr.shape[0]),
                 },
             )
+        interval_meta = _interval_summary(start, end, x_arr.shape[0], errors)
 
         original_state = np.random.get_state()
         best_candidate = None
         best_score = np.inf
         best_meta = None
         gaussian_error = None
+        gaussian_best_score = None
         try:
             for _ in range(self.n_samples):
                 np.random.seed(int(self.rng.integers(0, 2**31 - 1)))
@@ -412,17 +450,19 @@ class AnomalyRepairExplainer:
                 if score < best_score:
                     best_candidate = candidate
                     best_score = score
+                    gaussian_best_score = float(score)
                     best_meta = {
                         "method": "anomaly_repair",
                         "repair_strategy": "gaussian",
-                        "interval": (int(start), int(end)),
                         "interval_source": "shared_model_localizer",
-                        "score_before": float(score_before),
                         "score_source": "external_score_fn",
                         "repair_samples": int(self.n_samples),
                         "shared_interval_quantile": float(self.interval_quantile),
                     }
+                    best_meta.update(build_score_summary(score_before, score, self.threshold))
+                    best_meta.update(interval_meta)
                 if score <= self.threshold:
+                    best_meta.update(build_explainability_meta(x_arr, candidate))
                     return CFResult(
                         x_cf=candidate,
                         score_cf=float(score),
@@ -433,11 +473,20 @@ class AnomalyRepairExplainer:
         finally:
             np.random.set_state(original_state)
 
-        donor_result = self._try_donor_guided_repair(x_arr, score_before, start, end)
+        donor_result = self._try_donor_guided_repair(
+            x_arr,
+            score_before,
+            start,
+            end,
+            interval_meta,
+        )
+        donor_best_score = None
         if isinstance(donor_result, CFResult):
+            donor_result.meta.update(build_explainability_meta(x_arr, donor_result.x_cf))
             return donor_result
         if donor_result is not None:
             donor_candidate, donor_score, donor_meta = donor_result
+            donor_best_score = float(donor_score)
             if donor_score < best_score:
                 best_candidate = donor_candidate
                 best_score = donor_score
@@ -447,18 +496,37 @@ class AnomalyRepairExplainer:
             return CFFailure(
                 reason="repair_failed",
                 message=gaussian_error,
-                diagnostics={"interval": (int(start), int(end))},
+                diagnostics={
+                    **build_score_summary(score_before, None, self.threshold),
+                    **interval_meta,
+                    "gaussian_error": gaussian_error,
+                },
             )
+
+        best_candidate_summary = None
+        if best_candidate is not None and np.isfinite(best_score):
+            best_candidate_summary = build_explainability_meta(x_arr, best_candidate)
+            best_candidate_summary.update(
+                build_score_summary(score_before, float(best_score), self.threshold)
+            )
+            if best_meta is not None:
+                best_candidate_summary["repair_strategy"] = best_meta.get("repair_strategy")
 
         return CFFailure(
             reason="no_valid_cf",
             message="anomaly_repair did not find a valid counterfactual below the threshold",
             diagnostics={
-                "score_before": float(score_before),
-                "best_score": float(best_score) if np.isfinite(best_score) else None,
-                "interval": (int(start), int(end)),
+                **build_score_summary(
+                    score_before,
+                    None if not np.isfinite(best_score) else float(best_score),
+                    self.threshold,
+                ),
+                **interval_meta,
                 "best_candidate_found": best_candidate is not None,
                 "best_repair_strategy": None if best_meta is None else best_meta["repair_strategy"],
+                "best_candidate_summary": best_candidate_summary,
+                "gaussian_best_score": gaussian_best_score,
+                "donor_guided_best_score": donor_best_score,
                 "gaussian_error": gaussian_error,
             },
         )
