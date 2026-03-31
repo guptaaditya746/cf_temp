@@ -20,6 +20,75 @@ Editable dev install:
 pip install -e .
 ```
 
+## Branch Workflow
+
+Active development now happens on the `genetic` branch.
+
+```bash
+git switch genetic
+git pull
+git push -u origin genetic
+```
+
+`main` is kept as the stable/reference branch until the remote default branch is changed.
+
+## Running the Pipeline
+
+The repo now supports a staged pipeline layout:
+
+- `preprocessing.py`
+- `training.py`
+- `evaluation_model.py`
+- `generating_counterfactual.py`
+- `evaluation_counterfactual.py`
+
+Main settings live in [configs/defaults.py](/home/gupt_ad/part_2_local/push_repos_only/cf_temp/configs/defaults.py).
+
+### Prerequisites
+
+Install the runtime dependencies used by the pipeline example:
+
+```bash
+pip install -e .
+pip install torch pytorch-lightning pandas scikit-learn matplotlib seaborn
+```
+
+### End-to-End Run
+
+Run the full pipeline step by step using one shared run directory.
+
+```bash
+python preprocessing.py
+python training.py --run-dir results/run_YYYYMMDD-HHMMSS
+python evaluation_model.py --run-dir results/run_YYYYMMDD-HHMMSS
+python generating_counterfactual.py --run-dir results/run_YYYYMMDD-HHMMSS
+python evaluation_counterfactual.py --run-dir results/run_YYYYMMDD-HHMMSS
+```
+
+The first command creates a new run directory under `results/`. Use that same path for all later stages.
+
+### Single-Script Run
+
+To run the complete flow in one go:
+
+```bash
+python example.py
+```
+
+### Stage Outputs
+
+- preprocessing writes `X_train.npy`, `X_val.npy`, `X_calib.npy`, `X_test.npy`
+- training writes checkpoints and `training_metadata.json`
+- model evaluation writes files under `results/.../evaluation/`
+- counterfactual generation writes `counterfactual_log.csv` and `cf_arrays/`
+- counterfactual evaluation writes `counterfactual_summary.csv`
+
+### Customization
+
+- change dataset paths, split ratios, model choice, and method defaults in [configs/defaults.py](/home/gupt_ad/part_2_local/push_repos_only/cf_temp/configs/defaults.py)
+- add new black-box models in [models/autoencoder.py](/home/gupt_ad/part_2_local/push_repos_only/cf_temp/models/autoencoder.py) or another file under `models/`, then register them in `MODEL_REGISTRY`
+- add new counterfactual pipelines under [counterfactual_methods/pipeline.py](/home/gupt_ad/part_2_local/push_repos_only/cf_temp/counterfactual_methods/pipeline.py)
+
 ## Quick Start
 
 ```python
@@ -30,10 +99,15 @@ model = lambda x: x  # replace with your reconstruction model
 core = np.load("normal_core.npy")  # (K, L, F)
 x = np.load("window.npy")          # (L, F)
 
+def score_fn(window: np.ndarray) -> float:
+    recon = np.asarray(model(window))
+    return float(np.mean((window - recon) ** 2))
+
 explainer = CounterfactualExplainer(
     method="genetic",
     model=model,
     normal_core=core,
+    score_fn=score_fn,  # required: use the same scoring function as evaluation
     threshold=None,
     population_size=100,
     n_generations=50,
@@ -53,7 +127,7 @@ else:
 - input accepted by `cftsad`: `(L, F)` (and `(1, L, F)` fallback is supported)
 - output expected: same shape as input window (`(L, F)` or squeezable `(1, L, F)`)
 
-`cftsad` computes anomaly/reconstruction score internally.
+`score_fn` is required so counterfactual generation uses the exact same window-level scoring rule as evaluation.
 
 ### PyTorch usage (recommended)
 
@@ -78,6 +152,7 @@ explainer = CounterfactualExplainer(
     method="nearest",
     model=model,
     normal_core=core,
+    score_fn=score_fn,
     threshold=None,
 )
 ```
@@ -127,6 +202,7 @@ CounterfactualExplainer(
     method="nearest",  # "nearest" | "segment" | "motif" | "genetic"
     model=model,
     normal_core=core,
+    score_fn=score_fn,              # required: shared evaluation scoring function
     threshold=None,
     immutable_features=(0,),        # optional
     bounds={1: (-3.0, 3.0)},        # optional
@@ -139,6 +215,7 @@ CounterfactualExplainer(
 - `method`
 - `model`
 - `normal_core`
+- `score_fn`: required callable used for threshold/core building and counterfactual scoring
 - `threshold`: if `None`, estimated from normal core
 - `immutable_features`
 - `bounds`
@@ -233,6 +310,7 @@ explainer = CounterfactualExplainer(
     method="segment",
     model=model,
     normal_core=core,
+    score_fn=score_fn,
     threshold=0.1,
     enable_fallback_chain=True,
     fallback_methods=("motif", "nearest", "genetic"),
@@ -304,3 +382,10 @@ explainer.save_core("/tmp/cftsad_core.npz")
 loaded = CounterfactualExplainer.load_core("/tmp/cftsad_core.npz")
 print(loaded.keys())
 ```
+
+
+
+
+### legacy
+1. genetic : mostly its failing , so could be worked on latter on, but for now the probalabe cause its trying ot optiomize mostly validity
+2.

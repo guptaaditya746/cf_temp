@@ -1,5 +1,0 @@
-hidden_dim: 32
-latent_dim: 8
-lr: 0.001
-n_features: 6
-seq_len: 24

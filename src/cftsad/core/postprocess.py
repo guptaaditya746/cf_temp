@@ -39,3 +39,64 @@ def build_explainability_meta(
         "delta_l1": float(np.sum(abs_delta)),
         "delta_l2": float(np.sqrt(np.sum(delta * delta))),
     }
+
+
+def build_score_summary(
+    score_before: float,
+    score_after: float | None,
+    threshold: float,
+) -> Dict[str, Any]:
+    score_before = float(score_before)
+    threshold = float(threshold)
+    out: Dict[str, Any] = {
+        "score_before": score_before,
+        "threshold": threshold,
+        "threshold_gap_before": float(score_before - threshold),
+    }
+
+    if score_after is None:
+        out.update(
+            {
+                "score_after": None,
+                "score_delta": None,
+                "relative_score_delta": None,
+                "threshold_gap_after": None,
+            }
+        )
+        return out
+
+    score_after = float(score_after)
+    score_delta = float(score_before - score_after)
+    out.update(
+        {
+            "score_after": score_after,
+            "score_delta": score_delta,
+            "relative_score_delta": (
+                None if abs(score_before) < 1e-12 else float(score_delta / abs(score_before))
+            ),
+            "threshold_gap_after": float(score_after - threshold),
+        }
+    )
+    return out
+
+
+def build_candidate_summary(
+    x: np.ndarray,
+    candidate: Any,
+    threshold: float,
+    top_k: int = 3,
+) -> Dict[str, Any] | None:
+    if candidate is None:
+        return None
+
+    out = {
+        "score_cf": float(candidate.score_cf),
+        "proximity": float(candidate.proximity),
+        "sparsity": float(candidate.sparsity),
+        "plausibility": float(candidate.plausibility),
+        "threshold_gap_after": float(float(candidate.score_cf) - float(threshold)),
+    }
+    out.update(build_explainability_meta(x, candidate.x_cf, top_k=top_k))
+    if getattr(candidate, "diagnostics", None):
+        out["search_diagnostics"] = candidate.diagnostics
+    return out

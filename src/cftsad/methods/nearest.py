@@ -1,17 +1,31 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 
 from cftsad.core.candidates import compute_candidate_metrics, rank_candidates
 from cftsad.core.constraints import apply_constraints
 from cftsad.core.constraints_v2 import apply_constraints_v2
-from cftsad.core.postprocess import build_explainability_meta
+from cftsad.core.postprocess import (
+    build_candidate_summary,
+    build_explainability_meta,
+    build_score_summary,
+)
 from cftsad.core.distances import window_mse_distance
 from cftsad.core.scoring import reconstruction_score
 from cftsad.types import CFFailure, CFResult
+
+
+def _score_candidate(
+    model: object,
+    x_cf: np.ndarray,
+    score_fn: Optional[Callable[[np.ndarray], float]],
+) -> float:
+    if score_fn is not None:
+        return float(score_fn(np.asarray(x_cf, dtype=np.float64)))
+    return reconstruction_score(model, x_cf)
 
 
 def _window_weighted_distance(
@@ -25,6 +39,18 @@ def _window_weighted_distance(
     if timestep_weights is not None:
         sq = sq * timestep_weights[:, np.newaxis]
     return float(np.mean(sq))
+
+
+def _summarize_distribution(values: np.ndarray) -> dict:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return {"count": 0, "min": None, "median": None, "max": None}
+    return {
+        "count": int(arr.size),
+        "min": float(np.min(arr)),
+        "median": float(np.median(arr)),
+        "max": float(np.max(arr)),
+    }
 
 
 def generate_nearest(
@@ -41,13 +67,14 @@ def generate_nearest(
     use_constraints_v2: bool = False,
     max_delta_per_step: float | None = None,
     relational_linear: Dict[str, tuple[int, int, float]] | None = None,
+    score_fn: Optional[Callable[[np.ndarray], float]] = None,
 ) -> CFResult | CFFailure:
     t0 = time.perf_counter()
-    score_before = reconstruction_score(model, x)
+    score_before = _score_candidate(model, x, score_fn)
     thr = float(threshold)
 
     donor_scores = np.asarray(
-        [reconstruction_score(model, donor) for donor in normal_core],
+        [_score_candidate(model, donor, score_fn) for donor in normal_core],
         dtype=np.float64,
     )
     strict_thr = float(thr) * float(donor_filter_factor)
@@ -77,6 +104,14 @@ def generate_nearest(
     shortlist_local = np.argpartition(dists, k - 1)[:k]
     shortlist_local = shortlist_local[np.argsort(dists[shortlist_local])]
     shortlist_idx = donor_pool_idx[shortlist_local]
+    shortlist_summary = [
+        {
+            "donor_idx": int(donor_pool_idx[int(local_idx)]),
+            "donor_score": float(donor_scores[int(donor_pool_idx[int(local_idx)])]),
+            "donor_distance": float(dists[int(local_idx)]),
+        }
+        for local_idx in shortlist_local.tolist()
+    ]
 
     a_steps = max(2, int(alpha_steps))
     alphas = np.linspace(0.0, 1.0, a_steps)
@@ -110,7 +145,7 @@ def generate_nearest(
             if c_v < best_constraint_violation:
                 best_constraint_violation = float(c_v)
                 best_constraint_breakdown = c_break
-            score_after = reconstruction_score(model, x_cf)
+            score_after = _score_candidate(model, x_cf, score_fn)
             cand = compute_candidate_metrics(
                 x=x,
                 x_cf=x_cf,
@@ -127,22 +162,29 @@ def generate_nearest(
             candidates.append(cand)
 
     ranked = rank_candidates(candidates, threshold=thr)
+    best = ranked[0] if ranked else None
     runtime_ms = (time.perf_counter() - t0) * 1000.0
-    if ranked and ranked[0].score_cf <= thr:
-        best = ranked[0]
+    common_meta = {
+        "strict_donor_threshold": strict_thr,
+        "donor_pool_size": int(donor_pool_idx.size),
+        "shortlist_size": int(k),
+        "n_attempts": int(attempts),
+        "donor_pool_score_summary": _summarize_distribution(donor_scores[donor_pool_idx]),
+        "shortlist_donors": shortlist_summary,
+        "best_candidate_summary": build_candidate_summary(x, best, threshold=thr),
+        "runtime_ms": runtime_ms,
+        "score_source": "custom" if score_fn is not None else "reconstruction_score",
+    }
+    if best is not None and best.score_cf <= thr:
         meta = {
             "donor_idx": int(best.diagnostics["donor_idx"]),
             "alpha": float(best.diagnostics["alpha"]),
             "donor_distance": float(best.diagnostics["donor_distance"]),
-            "score_before": score_before,
-            "score_after": float(best.score_cf),
-            "strict_donor_threshold": strict_thr,
-            "shortlist_size": int(k),
-            "n_attempts": int(attempts),
             "constraint_violation": float(best.diagnostics["constraint_violation"]),
             "constraint_breakdown": best.diagnostics["constraint_breakdown"],
-            "runtime_ms": runtime_ms,
         }
+        meta.update(build_score_summary(score_before, float(best.score_cf), thr))
+        meta.update(common_meta)
         meta.update(build_explainability_meta(x, best.x_cf))
         return CFResult(x_cf=best.x_cf, score_cf=float(best.score_cf), meta=meta)
 
@@ -150,16 +192,15 @@ def generate_nearest(
         reason="no_valid_cf",
         message="Nearest donor shortlist did not satisfy threshold.",
         diagnostics={
-            "score_before": score_before,
-            "best_score_after": float(ranked[0].score_cf) if ranked else None,
-            "threshold": thr,
-            "strict_donor_threshold": strict_thr,
-            "shortlist_size": int(k),
-            "n_attempts": int(attempts),
+            **build_score_summary(
+                score_before,
+                None if best is None else float(best.score_cf),
+                thr,
+            ),
+            **common_meta,
             "best_constraint_violation": (
                 None if not np.isfinite(best_constraint_violation) else float(best_constraint_violation)
             ),
             "best_constraint_breakdown": best_constraint_breakdown,
-            "runtime_ms": runtime_ms,
         },
     )

@@ -21,12 +21,14 @@ class CounterfactualExplainer:
         method: Literal["nearest", "segment", "motif", "genetic"],
         model,
         normal_core: np.ndarray,
+        score_fn,
         threshold: Optional[float] = None,
         **method_kwargs,
     ):
         self.method = str(method)
         self.model = model
         self.normal_core = np.asarray(normal_core)
+        self.score_fn = score_fn
         self.threshold = threshold
 
         # Common knobs (usable by all methods)
@@ -51,16 +53,47 @@ class CounterfactualExplainer:
         self.motif_top_k = int(method_kwargs.pop("motif_top_k", 5))
         self.motif_n_segments = int(method_kwargs.pop("motif_n_segments", 4))
         self.motif_length_factors = tuple(
-            float(v) for v in method_kwargs.pop("motif_length_factors", (0.75, 1.0, 1.25))
+            float(v) for v in method_kwargs.pop("motif_length_factors", (1.0, 1.5, 2.0, 3.0))
         )
         self.motif_context_weight = float(method_kwargs.pop("motif_context_weight", 0.2))
         self.motif_use_affine_fit = bool(method_kwargs.pop("motif_use_affine_fit", True))
+        self.motif_allow_pair_search = bool(
+            method_kwargs.pop("motif_allow_pair_search", True)
+        )
+        self.motif_max_pair_groups = int(method_kwargs.pop("motif_max_pair_groups", 4))
+        self.motif_localizer_top_fraction = float(
+            method_kwargs.pop("motif_localizer_top_fraction", 0.1)
+        )
+        self.motif_localizer_padding = int(
+            method_kwargs.pop("motif_localizer_padding", 2)
+        )
+        self.motif_normalize_errors = bool(
+            method_kwargs.pop("motif_normalize_errors", True)
+        )
 
         self.segment_smoothing = bool(method_kwargs.pop("segment_smoothing", False))
         self.segment_n_candidates = int(method_kwargs.pop("segment_n_candidates", 4))
+        self.segment_length_factors = tuple(
+            float(v) for v in method_kwargs.pop("segment_length_factors", (1.0, 1.5, 2.0, 3.0))
+        )
         self.segment_top_k_donors = int(method_kwargs.pop("segment_top_k_donors", 8))
         self.segment_context_width = int(method_kwargs.pop("segment_context_width", 2))
         self.segment_crossfade_width = int(method_kwargs.pop("segment_crossfade_width", 3))
+        self.segment_allow_pair_search = bool(
+            method_kwargs.pop("segment_allow_pair_search", True)
+        )
+        self.segment_max_pair_groups = int(
+            method_kwargs.pop("segment_max_pair_groups", 4)
+        )
+        self.segment_localizer_top_fraction = float(
+            method_kwargs.pop("segment_localizer_top_fraction", 0.1)
+        )
+        self.segment_localizer_padding = int(
+            method_kwargs.pop("segment_localizer_padding", 2)
+        )
+        self.segment_normalize_errors = bool(
+            method_kwargs.pop("segment_normalize_errors", True)
+        )
 
         self.nearest_top_k = int(method_kwargs.pop("nearest_top_k", 10))
         self.nearest_alpha_steps = int(method_kwargs.pop("nearest_alpha_steps", 11))
@@ -116,6 +149,7 @@ class CounterfactualExplainer:
             model=self.model,
             normal_core=self.normal_core,
             threshold=self.threshold,
+            score_fn=self.score_fn,
             filter_factor=self.normal_core_filter_factor,
             threshold_quantile=self.normal_core_threshold_quantile,
             max_core_size=self.normal_core_max_size,
@@ -164,6 +198,9 @@ class CounterfactualExplainer:
                 return "threshold must be a numeric scalar"
             if not np.isfinite(thr) or thr < 0.0:
                 return "threshold must be finite and non-negative"
+
+        if not callable(self.score_fn):
+            return "score_fn is required and must be callable"
 
         if (
             not np.isfinite(self.normal_core_filter_factor)
@@ -252,12 +289,22 @@ class CounterfactualExplainer:
 
         if self.segment_n_candidates < 1:
             return "segment_n_candidates must be >= 1"
+        if not self.segment_length_factors:
+            return "segment_length_factors must be non-empty"
+        if any(v <= 0.0 or not np.isfinite(v) for v in self.segment_length_factors):
+            return "segment_length_factors values must be finite and > 0"
         if self.segment_top_k_donors < 1:
             return "segment_top_k_donors must be >= 1"
         if self.segment_context_width < 0:
             return "segment_context_width must be >= 0"
         if self.segment_crossfade_width < 1:
             return "segment_crossfade_width must be >= 1"
+        if self.segment_max_pair_groups < 0:
+            return "segment_max_pair_groups must be >= 0"
+        if not (0.0 < self.segment_localizer_top_fraction <= 1.0):
+            return "segment_localizer_top_fraction must be in (0, 1]"
+        if self.segment_localizer_padding < 0:
+            return "segment_localizer_padding must be >= 0"
 
         if self.motif_n_segments < 1:
             return "motif_n_segments must be >= 1"
@@ -272,6 +319,12 @@ class CounterfactualExplainer:
             or self.motif_context_weight < 0.0
         ):
             return "motif_context_weight must be finite and >= 0"
+        if self.motif_max_pair_groups < 0:
+            return "motif_max_pair_groups must be >= 0"
+        if not (0.0 < self.motif_localizer_top_fraction <= 1.0):
+            return "motif_localizer_top_fraction must be in (0, 1]"
+        if self.motif_localizer_padding < 0:
+            return "motif_localizer_padding must be >= 0"
 
         if self.fallback_retry_budget < 0:
             return "fallback_retry_budget must be >= 0"
@@ -316,6 +369,7 @@ class CounterfactualExplainer:
                 use_constraints_v2=self.use_constraints_v2,
                 max_delta_per_step=self.max_delta_per_step,
                 relational_linear=self.relational_linear,
+                score_fn=self.score_fn,
             )
 
         if method == "segment":
@@ -328,12 +382,19 @@ class CounterfactualExplainer:
                 bounds=self.bounds,
                 smoothing=self.segment_smoothing,
                 n_segments=self.segment_n_candidates,
+                length_factors=self.segment_length_factors,
                 top_k_donors=self.segment_top_k_donors,
                 context_width=self.segment_context_width,
                 crossfade_width=self.segment_crossfade_width,
+                allow_pair_search=self.segment_allow_pair_search,
+                max_pair_groups=self.segment_max_pair_groups,
+                localizer_top_fraction=self.segment_localizer_top_fraction,
+                localizer_padding=self.segment_localizer_padding,
+                normalize_errors=self.segment_normalize_errors,
                 use_constraints_v2=self.use_constraints_v2,
                 max_delta_per_step=self.max_delta_per_step,
                 relational_linear=self.relational_linear,
+                score_fn=self.score_fn,
             )
 
         if method == "motif":
@@ -349,9 +410,15 @@ class CounterfactualExplainer:
                 length_factors=self.motif_length_factors,
                 context_weight=self.motif_context_weight,
                 use_affine_fit=self.motif_use_affine_fit,
+                allow_pair_search=self.motif_allow_pair_search,
+                max_pair_groups=self.motif_max_pair_groups,
+                localizer_top_fraction=self.motif_localizer_top_fraction,
+                localizer_padding=self.motif_localizer_padding,
+                normalize_errors=self.motif_normalize_errors,
                 use_constraints_v2=self.use_constraints_v2,
                 max_delta_per_step=self.max_delta_per_step,
                 relational_linear=self.relational_linear,
+                score_fn=self.score_fn,
             )
 
         if method == "genetic":
@@ -376,6 +443,7 @@ class CounterfactualExplainer:
                 use_constraints_v2=self.use_constraints_v2,
                 max_delta_per_step=self.max_delta_per_step,
                 relational_linear=self.relational_linear,
+                score_fn=self.score_fn,
                 random_seed=self.random_seed,
             )
 
