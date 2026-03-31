@@ -15,6 +15,113 @@ from evaluation.reconstruction import build_score_fn
 from cftsad import CFFailure, CFResult, CounterfactualExplainer
 
 
+def _extract_best_failure_score(result):
+    if not isinstance(result, CFFailure):
+        return None
+
+    diagnostics = result.diagnostics or {}
+    for key in ("score_after", "gaussian_best_score", "donor_guided_best_score"):
+        value = diagnostics.get(key)
+        if value is not None and np.isfinite(value):
+            return float(value)
+    return None
+
+
+def _relaxed_retry_overrides(explainer):
+    if isinstance(explainer, AnomalyRepairExplainer):
+        overrides = {
+            "n_samples": max(int(getattr(explainer, "n_samples", 1)), 50),
+            "fallback_top_k": max(int(getattr(explainer, "fallback_top_k", 1)), 12),
+            "fallback_alpha_steps": max(int(getattr(explainer, "fallback_alpha_steps", 2)), 15),
+        }
+        if hasattr(explainer, "max_features_to_try"):
+            overrides["max_features_to_try"] = max(
+                int(getattr(explainer, "max_features_to_try", 1)),
+                12,
+            )
+        if hasattr(explainer, "subset_search_width"):
+            overrides["subset_search_width"] = max(
+                int(getattr(explainer, "subset_search_width", 1)),
+                6,
+            )
+        if hasattr(explainer, "max_subset_size"):
+            overrides["max_subset_size"] = max(
+                int(getattr(explainer, "max_subset_size", 1)),
+                3,
+            )
+        if hasattr(explainer, "subset_eval_samples"):
+            overrides["subset_eval_samples"] = max(
+                int(getattr(explainer, "subset_eval_samples", 1)),
+                5,
+            )
+        return overrides
+
+    method = getattr(explainer, "method", None)
+    if method == "segment":
+        return {
+            "segment_n_candidates": max(int(getattr(explainer, "segment_n_candidates", 1)), 8),
+            "segment_top_k_donors": max(int(getattr(explainer, "segment_top_k_donors", 1)), 16),
+            "segment_max_pair_groups": max(int(getattr(explainer, "segment_max_pair_groups", 0)), 8),
+            "segment_context_width": max(int(getattr(explainer, "segment_context_width", 0)), 3),
+        }
+    if method == "motif":
+        return {
+            "motif_n_segments": max(int(getattr(explainer, "motif_n_segments", 1)), 8),
+            "motif_top_k": max(int(getattr(explainer, "motif_top_k", 1)), 12),
+            "motif_max_pair_groups": max(int(getattr(explainer, "motif_max_pair_groups", 0)), 8),
+        }
+    if method == "nearest":
+        return {
+            "nearest_top_k": max(int(getattr(explainer, "nearest_top_k", 1)), 20),
+            "nearest_alpha_steps": max(int(getattr(explainer, "nearest_alpha_steps", 2)), 21),
+        }
+    return {}
+
+
+def _run_with_overrides(explainer, x_anomaly, overrides):
+    if not overrides:
+        return explainer.explain(x_anomaly), {}
+
+    original = {}
+    for key, value in overrides.items():
+        if hasattr(explainer, key):
+            original[key] = getattr(explainer, key)
+            setattr(explainer, key, value)
+
+    try:
+        return explainer.explain(x_anomaly), original
+    finally:
+        for key, value in original.items():
+            setattr(explainer, key, value)
+
+
+def _maybe_retry_with_relaxed_search(explainer, x_anomaly, result):
+    if not isinstance(result, CFFailure) or result.reason != "no_valid_cf":
+        return result
+
+    overrides = _relaxed_retry_overrides(explainer)
+    retry_result, applied = _run_with_overrides(explainer, x_anomaly, overrides)
+    if not applied:
+        return result
+
+    if isinstance(retry_result, CFResult):
+        retry_result.meta["relaxed_retry_used"] = True
+        retry_result.meta["relaxed_retry_overrides"] = dict(applied)
+        retry_result.meta["relaxed_retry_trigger"] = result.reason
+        return retry_result
+
+    original_best = _extract_best_failure_score(result)
+    retry_best = _extract_best_failure_score(retry_result)
+    if retry_best is not None and (original_best is None or retry_best < original_best):
+        retry_result.diagnostics["relaxed_retry_used"] = True
+        retry_result.diagnostics["relaxed_retry_overrides"] = dict(applied)
+        retry_result.diagnostics["relaxed_retry_trigger"] = result.reason
+        return retry_result
+
+    result.diagnostics["relaxed_retry_used"] = True
+    result.diagnostics["relaxed_retry_overrides"] = dict(applied)
+    result.diagnostics["relaxed_retry_trigger"] = result.reason
+    return result
 
 
 def _safe_log_value(value):
@@ -110,6 +217,7 @@ def run_counterfactual_benchmark(
     results_by_method = {}
     for method_name, explainer in explainers.items():
         result = explainer.explain(x_anomaly)
+        result = _maybe_retry_with_relaxed_search(explainer, x_anomaly, result)
         results_by_method[method_name] = result
 
         row = {
@@ -131,8 +239,18 @@ def run_counterfactual_benchmark(
             for key, value in result.meta.items():
                 row[f"meta_{key}"] = _safe_log_value(value)
         else:
-            print(f"[{method_name}] failed -> {result.reason}")
-            row["cf_score"] = np.nan
+            best_score = result.diagnostics.get("score_after")
+            if best_score is None:
+                best_score = result.diagnostics.get("gaussian_best_score")
+            if best_score is None:
+                best_score = result.diagnostics.get("donor_guided_best_score")
+
+            if best_score is not None and np.isfinite(best_score):
+                print(f"[{method_name}] no valid cf -> best_cf_score={float(best_score):.4f}")
+                row["cf_score"] = float(best_score)
+            else:
+                print(f"[{method_name}] no valid cf -> best_cf_score=N/A")
+                row["cf_score"] = np.nan
             row["reason"] = result.reason
             row["message"] = result.message
             row["cf_array_file"] = "N/A"
