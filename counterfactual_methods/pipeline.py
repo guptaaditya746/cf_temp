@@ -225,7 +225,7 @@ def run_counterfactual_benchmark(
             "test_index": int(idx_to_explain),
             "original_score": float(original_score),
             "target_threshold": float(threshold),
-            "status": "success" if isinstance(result, CFResult) else "failed",
+            "status": "success" if isinstance(result, CFResult) else "best_effort",
         }
 
         if isinstance(result, CFResult):
@@ -252,7 +252,12 @@ def run_counterfactual_benchmark(
                 print(f"[{method_name}] no valid cf -> best_cf_score=N/A")
                 row["cf_score"] = np.nan
             row["reason"] = result.reason
-            row["message"] = result.message
+            if best_score is not None and np.isfinite(best_score):
+                row["message"] = (
+                    f"{result.message} Best cf_score reached: {float(best_score):.4f}"
+                )
+            else:
+                row["message"] = result.message
             row["cf_array_file"] = "N/A"
             for key, value in result.diagnostics.items():
                 row[f"diag_{key}"] = _safe_log_value(value)
