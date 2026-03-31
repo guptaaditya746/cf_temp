@@ -1,5 +1,12 @@
+import itertools
+
 import numpy as np
 from scipy.stats import multivariate_normal as mvn
+
+try:
+    import torch
+except Exception:  # pragma: no cover - torch may be unavailable
+    torch = None
 
 
 from cftsad.core.localization import compute_localization_errors
@@ -16,22 +23,41 @@ def _stabilize_covariance(cov, min_eig=1e-8):
     return (eigvecs * eigvals[None, :]) @ eigvecs.T
 
 
-def _crossfade_boundaries(x_cf, x_original, start, end, width=2):
+def _as_numpy(x):
+    if isinstance(x, np.ndarray):
+        return x
+    if torch is not None and isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _crossfade_boundaries(x_cf, x_original, start, end, width=2, features=None):
     out = np.array(x_cf, copy=True)
     w = max(0, int(width))
     if w == 0:
         return out
+    feature_idx = (
+        slice(None)
+        if features is None
+        else np.asarray(features, dtype=int)
+    )
 
     for i in range(1, w + 1):
         li = start - i
         if li >= 0:
             alpha = float(i) / float(w + 1)
-            out[li] = (1.0 - alpha) * x_original[li] + alpha * out[li]
+            out[li, feature_idx] = (
+                (1.0 - alpha) * x_original[li, feature_idx]
+                + alpha * out[li, feature_idx]
+            )
 
         ri = end + i - 1
         if ri < out.shape[0]:
             alpha = float(i) / float(w + 1)
-            out[ri] = (1.0 - alpha) * x_original[ri] + alpha * out[ri]
+            out[ri, feature_idx] = (
+                (1.0 - alpha) * x_original[ri, feature_idx]
+                + alpha * out[ri, feature_idx]
+            )
 
     return out
 
@@ -305,6 +331,11 @@ class AnomalyRepairExplainer:
         crossfade_width=2,
         normalize_errors=True,
         random_seed=42,
+        max_features_to_try=8,
+        subset_search_width=4,
+        max_subset_size=2,
+        subset_eval_samples=3,
+        subset_report_top_k=10,
     ):
         self.model = model
         self.threshold = float(threshold)
@@ -324,6 +355,11 @@ class AnomalyRepairExplainer:
         self.context_width = int(context_width)
         self.crossfade_width = int(crossfade_width)
         self.normalize_errors = bool(normalize_errors)
+        self.max_features_to_try = int(max_features_to_try)
+        self.subset_search_width = int(subset_search_width)
+        self.max_subset_size = int(max_subset_size)
+        self.subset_eval_samples = int(subset_eval_samples)
+        self.subset_report_top_k = int(subset_report_top_k)
         self.rng = np.random.default_rng(random_seed)
         self._current_interval = None
 
@@ -358,7 +394,212 @@ class AnomalyRepairExplainer:
             return float(np.mean(parts))
         return float(np.mean((x - donor) ** 2))
 
-    def _try_donor_guided_repair(self, x_arr, score_before, start, end, interval_meta):
+    def _reconstruct_with_model(self, x):
+        if torch is not None and isinstance(self.model, torch.nn.Module):
+            param = next(self.model.parameters(), None)
+            device = param.device if param is not None else torch.device("cpu")
+            self.model.eval()
+            with torch.no_grad():
+                x_tensor = torch.as_tensor(x, dtype=torch.float32, device=device)
+                y = _as_numpy(self.model(x_tensor.unsqueeze(0)))
+        else:
+            try:
+                y = _as_numpy(self.model(x))
+            except Exception:
+                y = _as_numpy(self.model(x[np.newaxis, ...]))
+
+        y = np.asarray(y, dtype=np.float64)
+        if y.shape == x.shape:
+            return y
+        if y.ndim == 3 and y.shape[0] == 1 and y.shape[1:] == x.shape:
+            return y[0]
+        raise ValueError(
+            f"Model reconstruction shape mismatch in anomaly_repair: {y.shape} vs {x.shape}"
+        )
+
+    def _rank_features(self, x_arr, start, end):
+        feature_errors = np.mean(
+            np.square(x_arr[start:end, :] - self._reconstruct_with_model(x_arr)[start:end, :]),
+            axis=0,
+        )
+        feature_order = np.argsort(-feature_errors)
+        return feature_order, feature_errors
+
+    def _build_feature_subsets(self, feature_order, n_features):
+        if n_features <= 0:
+            return []
+
+        limited_order = feature_order[: max(1, min(n_features, self.max_features_to_try))]
+        beam = limited_order[: max(1, min(len(limited_order), self.subset_search_width))]
+
+        subsets = [tuple([int(idx)]) for idx in limited_order.tolist()]
+        for subset_size in range(2, max(2, self.max_subset_size + 1)):
+            if subset_size > len(beam):
+                break
+            subsets.extend(
+                tuple(int(idx) for idx in combo)
+                for combo in itertools.combinations(beam.tolist(), subset_size)
+            )
+
+        full_subset = tuple(range(int(n_features)))
+        if full_subset not in subsets:
+            subsets.append(full_subset)
+
+        deduped = []
+        seen = set()
+        for subset in subsets:
+            key = tuple(sorted(int(idx) for idx in subset))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(key)
+        return deduped
+
+    def _apply_subset_patch(self, x_arr, start, end, features, replacement):
+        feature_idx = np.asarray(features, dtype=int)
+        candidate = np.array(x_arr, copy=True)
+        candidate[start:end, feature_idx] = replacement
+        return _crossfade_boundaries(
+            candidate,
+            x_arr,
+            start=start,
+            end=end,
+            width=self.crossfade_width,
+            features=feature_idx,
+        )
+
+    def _subset_meta(self, tested_features, feature_order, feature_errors):
+        tested = [int(idx) for idx in tested_features]
+        return {
+            "tested_features": tested,
+            "fixed_features": [
+                int(idx)
+                for idx in range(len(feature_errors))
+                if idx not in set(tested)
+            ],
+            "tested_feature_count": int(len(tested)),
+            "feature_priority": [
+                {
+                    "feature": int(idx),
+                    "interval_reconstruction_mse": float(feature_errors[int(idx)]),
+                }
+                for idx in feature_order.tolist()
+            ],
+        }
+
+    def _summarize_subset_trials(self, trials):
+        if not trials:
+            return []
+        ranked = sorted(
+            trials,
+            key=lambda item: (
+                -item["score_drop"],
+                item["score_after"],
+                item["tested_feature_count"],
+                item["tested_features"],
+            ),
+        )
+        return ranked[: max(1, self.subset_report_top_k)]
+
+    def _try_gaussian_subset_repair(
+        self,
+        x_arr,
+        score_before,
+        start,
+        end,
+        interval_meta,
+        feature_subsets,
+        feature_order,
+        feature_errors,
+    ):
+        best_candidate = None
+        best_score = np.inf
+        best_meta = None
+        subset_trials = []
+        eval_samples = max(1, min(self.n_samples, self.subset_eval_samples))
+
+        for subset in feature_subsets:
+            fixed_features = tuple(
+                idx for idx in range(x_arr.shape[1]) if idx not in set(subset)
+            )
+            subset_best_candidate = None
+            subset_best_score = np.inf
+
+            for _ in range(eval_samples):
+                np.random.seed(int(self.rng.integers(0, 2**31 - 1)))
+                replacement = sample_replacement(
+                    x_arr.T,
+                    (start, end),
+                    td=self.td,
+                    cond=fixed_features,
+                    enforce_psd=self.enforce_psd,
+                ).T
+                candidate = self._apply_subset_patch(
+                    x_arr,
+                    start,
+                    end,
+                    subset,
+                    replacement,
+                )
+                score = self._score(candidate)
+                if score < subset_best_score:
+                    subset_best_candidate = candidate
+                    subset_best_score = score
+
+            if subset_best_candidate is None:
+                continue
+
+            subset_meta = {
+                "method": "anomaly_repair",
+                "repair_strategy": "gaussian_subset",
+                "feature_search_mode": "explicit_subset_search",
+                "interval_source": "shared_model_localizer",
+                "score_source": "external_score_fn",
+                "repair_samples": int(eval_samples),
+                "shared_interval_quantile": float(self.interval_quantile),
+            }
+            subset_meta.update(self._subset_meta(subset, feature_order, feature_errors))
+            subset_meta.update(build_score_summary(score_before, subset_best_score, self.threshold))
+            subset_meta.update(interval_meta)
+
+            subset_trials.append(
+                {
+                    "tested_features": subset_meta["tested_features"],
+                    "tested_feature_count": subset_meta["tested_feature_count"],
+                    "score_after": float(subset_best_score),
+                    "score_drop": float(score_before - subset_best_score),
+                    "repair_strategy": "gaussian_subset",
+                }
+            )
+
+            if subset_best_score < best_score:
+                best_candidate = subset_best_candidate
+                best_score = subset_best_score
+                best_meta = subset_meta
+            if subset_best_score <= self.threshold:
+                subset_meta["subset_trials"] = self._summarize_subset_trials(subset_trials)
+                subset_meta.update(build_explainability_meta(x_arr, subset_best_candidate))
+                return CFResult(
+                    x_cf=subset_best_candidate,
+                    score_cf=float(subset_best_score),
+                    meta=subset_meta,
+                )
+
+        if best_meta is not None:
+            best_meta["subset_trials"] = self._summarize_subset_trials(subset_trials)
+        return best_candidate, best_score, best_meta
+
+    def _try_donor_guided_repair(
+        self,
+        x_arr,
+        score_before,
+        start,
+        end,
+        interval_meta,
+        feature_subsets,
+        feature_order,
+        feature_errors,
+    ):
         if self.normal_core is None or self.normal_core.ndim != 3 or self.normal_core.shape[0] == 0:
             return None
 
@@ -392,28 +633,42 @@ class AnomalyRepairExplainer:
         best_candidate = None
         best_score = np.inf
         best_meta = None
+        subset_trials = []
 
         for donor_idx in top_idx:
             donor = donor_pool[int(donor_idx)]
-            donor_slice = donor[start:end, :]
-            for alpha in alphas:
-                candidate = np.array(x_arr, copy=True)
-                candidate[start:end, :] = (
-                    (1.0 - float(alpha)) * x_arr[start:end, :]
-                    + float(alpha) * donor_slice
-                )
-                candidate = _crossfade_boundaries(
-                    candidate,
-                    x_arr,
-                    start=start,
-                    end=end,
-                    width=self.crossfade_width,
-                )
+            for subset in feature_subsets:
+                feature_idx = np.asarray(subset, dtype=int)
+                donor_slice = donor[start:end, :][:, feature_idx]
+                subset_best_candidate = None
+                subset_best_score = np.inf
+                subset_best_alpha = None
 
-                score = self._score(candidate)
+                for alpha in alphas:
+                    replacement = (
+                        (1.0 - float(alpha)) * x_arr[start:end, :][:, feature_idx]
+                        + float(alpha) * donor_slice
+                    )
+                    candidate = self._apply_subset_patch(
+                        x_arr,
+                        start,
+                        end,
+                        subset,
+                        replacement,
+                    )
+                    score = self._score(candidate)
+                    if score < subset_best_score:
+                        subset_best_candidate = candidate
+                        subset_best_score = score
+                        subset_best_alpha = float(alpha)
+
+                if subset_best_candidate is None:
+                    continue
+
                 meta = {
                     "method": "anomaly_repair",
-                    "repair_strategy": "donor_guided",
+                    "repair_strategy": "donor_guided_subset",
+                    "feature_search_mode": "explicit_subset_search",
                     "interval": (int(start), int(end)),
                     "interval_source": "shared_model_localizer",
                     "score_before": float(score_before),
@@ -421,20 +676,39 @@ class AnomalyRepairExplainer:
                     "shared_interval_quantile": float(self.interval_quantile),
                     "donor_idx": int(donor_indices[int(donor_idx)]),
                     "donor_context_distance": float(donor_dists[int(donor_idx)]),
-                    "alpha": float(alpha),
+                    "alpha": float(subset_best_alpha),
                     "fallback_top_k": int(self.fallback_top_k),
                     "fallback_alpha_steps": int(self.fallback_alpha_steps),
                     "donor_shortlist": shortlist_donors,
-                    "n_attempts": int(len(top_idx) * len(alphas)),
+                    "n_attempts": int(len(top_idx) * len(alphas) * max(1, len(feature_subsets))),
                 }
-                meta.update(build_score_summary(score_before, score, self.threshold))
+                meta.update(self._subset_meta(subset, feature_order, feature_errors))
+                meta.update(build_score_summary(score_before, subset_best_score, self.threshold))
                 meta.update(interval_meta)
-                if score < best_score:
-                    best_candidate = candidate
-                    best_score = score
+                subset_trials.append(
+                    {
+                        "tested_features": meta["tested_features"],
+                        "tested_feature_count": meta["tested_feature_count"],
+                        "score_after": float(subset_best_score),
+                        "score_drop": float(score_before - subset_best_score),
+                        "repair_strategy": "donor_guided_subset",
+                        "donor_idx": int(donor_indices[int(donor_idx)]),
+                    }
+                )
+                if subset_best_score < best_score:
+                    best_candidate = subset_best_candidate
+                    best_score = subset_best_score
                     best_meta = meta
-                if score <= self.threshold:
-                    return CFResult(x_cf=candidate, score_cf=float(score), meta=meta)
+                if subset_best_score <= self.threshold:
+                    meta["subset_trials"] = self._summarize_subset_trials(subset_trials)
+                    return CFResult(
+                        x_cf=subset_best_candidate,
+                        score_cf=float(subset_best_score),
+                        meta=meta,
+                    )
+
+        if best_meta is not None:
+            best_meta["subset_trials"] = self._summarize_subset_trials(subset_trials)
 
         return best_candidate, best_score, best_meta
 
@@ -487,6 +761,19 @@ class AnomalyRepairExplainer:
             normalize_errors=self.normalize_errors,
             reference=reference,
         )
+        try:
+            feature_order, feature_errors = self._rank_features(x_arr, start, end)
+        except Exception as exc:
+            return CFFailure(
+                reason="repair_failed",
+                message=str(exc),
+                diagnostics={
+                    **build_score_summary(score_before, None, self.threshold),
+                    **interval_meta,
+                    "feature_ranking_error": str(exc),
+                },
+            )
+        feature_subsets = self._build_feature_subsets(feature_order, x_arr.shape[1])
 
         original_state = np.random.get_state()
         best_candidate = None
@@ -495,39 +782,22 @@ class AnomalyRepairExplainer:
         gaussian_error = None
         gaussian_best_score = None
         try:
-            for _ in range(self.n_samples):
-                np.random.seed(int(self.rng.integers(0, 2**31 - 1)))
-                replacement = sample_replacement(
-                    x_arr.T,
-                    (start, end),
-                    td=self.td,
-                    cond=None,
-                    enforce_psd=self.enforce_psd,
-                ).T
-                candidate = x_arr.copy()
-                candidate[start:end, :] = replacement
-                score = self._score(candidate)
-                if score < best_score:
-                    best_candidate = candidate
-                    best_score = score
-                    gaussian_best_score = float(score)
-                    best_meta = {
-                        "method": "anomaly_repair",
-                        "repair_strategy": "gaussian",
-                        "interval_source": "shared_model_localizer",
-                        "score_source": "external_score_fn",
-                        "repair_samples": int(self.n_samples),
-                        "shared_interval_quantile": float(self.interval_quantile),
-                    }
-                    best_meta.update(build_score_summary(score_before, score, self.threshold))
-                    best_meta.update(interval_meta)
-                if score <= self.threshold:
-                    best_meta.update(build_explainability_meta(x_arr, candidate))
-                    return CFResult(
-                        x_cf=candidate,
-                        score_cf=float(score),
-                        meta=dict(best_meta),
-                    )
+            gaussian_result = self._try_gaussian_subset_repair(
+                x_arr,
+                score_before,
+                start,
+                end,
+                interval_meta,
+                feature_subsets,
+                feature_order,
+                feature_errors,
+            )
+            if isinstance(gaussian_result, CFResult):
+                return gaussian_result
+            if gaussian_result is not None:
+                best_candidate, best_score, best_meta = gaussian_result
+                if np.isfinite(best_score):
+                    gaussian_best_score = float(best_score)
         except Exception as exc:
             gaussian_error = str(exc)
         finally:
@@ -539,6 +809,9 @@ class AnomalyRepairExplainer:
             start,
             end,
             interval_meta,
+            feature_subsets,
+            feature_order,
+            feature_errors,
         )
         donor_best_score = None
         if isinstance(donor_result, CFResult):
@@ -571,6 +844,9 @@ class AnomalyRepairExplainer:
             )
             if best_meta is not None:
                 best_candidate_summary["repair_strategy"] = best_meta.get("repair_strategy")
+                best_candidate_summary["tested_features"] = best_meta.get("tested_features")
+                best_candidate_summary["fixed_features"] = best_meta.get("fixed_features")
+                best_candidate_summary["subset_trials"] = best_meta.get("subset_trials")
 
         return CFFailure(
             reason="no_valid_cf",
